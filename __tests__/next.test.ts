@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { createOAuthHandlers, getAuth, OAuthProvider, MemoryStore, type OAuthContext } from '../src/next';
+import {
+  createOAuthHandlers,
+  getAuth,
+  OAuthProvider,
+  MemoryStore,
+  type OAuthContext,
+  type ExternalAuthResult,
+} from '../src/next';
 
 // Simple API handler for testing
 const testApiHandler = {
@@ -209,6 +216,51 @@ describe('getAuth', () => {
     expect(result.authenticated).toBe(false);
     if (!result.authenticated) {
       expect(result.error.status).toBe(401);
+    }
+  });
+
+  it('should resolve external token via resolveExternalToken callback', async () => {
+    const request = createMockRequest('https://example.com/api/data', 'GET', {
+      Authorization: 'Bearer external-opaque-token',
+    });
+
+    const result = await getAuth(provider, request, {
+      resolveExternalToken: async ({ token }) => {
+        if (token === 'external-opaque-token') {
+          return { props: { sub: 'ext-user', plan: 'pro' } };
+        }
+        return null;
+      },
+    });
+
+    expect(result.authenticated).toBe(true);
+    if (result.authenticated) {
+      const ext = result as ExternalAuthResult;
+      expect(ext.external).toBe(true);
+      expect(ext.props.sub).toBe('ext-user');
+      expect(ext.props.plan).toBe('pro');
+    }
+  });
+
+  it('should reject external token when audience does not match', async () => {
+    const request = createMockRequest('https://example.com/api/data', 'GET', {
+      Authorization: 'Bearer external-audience-token',
+    });
+
+    const result = await getAuth(provider, request, {
+      resolveExternalToken: async () => {
+        return {
+          props: { sub: 'ext-user' },
+          audience: 'https://other-server.example.com/api',
+        };
+      },
+    });
+
+    expect(result.authenticated).toBe(false);
+    if (!result.authenticated) {
+      expect(result.error.status).toBe(401);
+      const body = (await result.error.json()) as any;
+      expect(body.error_description).toContain('audience');
     }
   });
 

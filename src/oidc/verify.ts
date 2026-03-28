@@ -128,6 +128,14 @@ export async function verifyIdToken(token: string, options: VerifyIdTokenOptions
   // 6. Validate claims
   const payload = jwt.payload as IdTokenPayload;
 
+  // Required OIDC claims: sub and iat (iss, aud, exp checked below)
+  if (typeof payload.sub !== 'string' || !payload.sub) {
+    throw new Error('Missing required claim: sub');
+  }
+  if (typeof payload.iat !== 'number') {
+    throw new Error('Missing required claim: iat');
+  }
+
   if (payload.iss !== options.issuer) {
     throw new Error(`Issuer mismatch: expected ${options.issuer}, got ${payload.iss}`);
   }
@@ -141,7 +149,7 @@ export async function verifyIdToken(token: string, options: VerifyIdTokenOptions
     throw new Error('Token has expired');
   }
 
-  if (payload.iat !== undefined && payload.iat > now + clockTolerance) {
+  if (payload.iat > now + clockTolerance) {
     throw new Error('Token issued in the future');
   }
 
