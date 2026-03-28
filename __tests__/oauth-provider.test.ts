@@ -1,147 +1,22 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { OAuthProvider, type OAuthHelpers } from '../src/oauth-provider';
-import type { ExecutionContext } from '@cloudflare/workers-types';
-// We're importing WorkerEntrypoint from our mock implementation
-// The actual import is mocked in setup.ts
-import { WorkerEntrypoint } from 'cloudflare:workers';
-
-/**
- * Mock KV namespace implementation that stores data in memory
- */
-class MockKV {
-  private storage: Map<string, { value: any; expiration?: number }> = new Map();
-
-  async put(key: string, value: string | ArrayBuffer, options?: { expirationTtl?: number }): Promise<void> {
-    let expirationTime: number | undefined = undefined;
-
-    if (options?.expirationTtl) {
-      expirationTime = Date.now() + options.expirationTtl * 1000;
-    }
-
-    this.storage.set(key, { value, expiration: expirationTime });
-  }
-
-  async get(key: string, options?: { type: 'text' | 'json' | 'arrayBuffer' | 'stream' }): Promise<any> {
-    const item = this.storage.get(key);
-
-    if (!item) {
-      return null;
-    }
-
-    if (item.expiration && item.expiration < Date.now()) {
-      this.storage.delete(key);
-      return null;
-    }
-
-    if (options?.type === 'json' && typeof item.value === 'string') {
-      return JSON.parse(item.value);
-    }
-
-    return item.value;
-  }
-
-  async delete(key: string): Promise<void> {
-    this.storage.delete(key);
-  }
-
-  async list(options: { prefix: string; limit?: number; cursor?: string }): Promise<{
-    keys: { name: string }[];
-    list_complete: boolean;
-    cursor?: string;
-  }> {
-    const { prefix, limit = 1000 } = options;
-    let keys: { name: string }[] = [];
-
-    for (const key of this.storage.keys()) {
-      if (key.startsWith(prefix)) {
-        const item = this.storage.get(key);
-        if (item && (!item.expiration || item.expiration >= Date.now())) {
-          keys.push({ name: key });
-        }
-      }
-
-      if (keys.length >= limit) {
-        break;
-      }
-    }
-
-    return {
-      keys,
-      list_complete: true,
-    };
-  }
-
-  clear() {
-    this.storage.clear();
-  }
-}
-
-/**
- * Mock execution context for Cloudflare Workers
- */
-class MockExecutionContext implements ExecutionContext {
-  props: any = {};
-
-  waitUntil(promise: Promise<any>): void {
-    // In tests, we can just ignore waitUntil
-  }
-
-  passThroughOnException(): void {
-    // No-op for tests
-  }
-}
-
-// Test environment type
-type TestEnv = {
-  OAUTH_KV: MockKV;
-  OAUTH_PROVIDER: OAuthHelpers | null;
-};
+import { OAuthProvider, MemoryStore, type OAuthHelpers, type OAuthContext } from '../src/oauth-provider';
 
 // Simple API handler for testing
-class TestApiHandler extends WorkerEntrypoint<TestEnv> {
-  fetch(request: Request) {
+const testApiHandler = {
+  async fetch(request: Request, ctx: OAuthContext) {
     const url = new URL(request.url);
-
     if (url.pathname.startsWith('/api/')) {
-      // Return authenticated user info from ctx.props
       return new Response(
         JSON.stringify({
           success: true,
-          user: this.ctx.props,
+          user: ctx.props,
         }),
         {
           headers: { 'Content-Type': 'application/json' },
         }
       );
     }
-
     return new Response('Not found', { status: 404 });
-  }
-}
-
-// Simple default handler for testing
-const testDefaultHandler = {
-  async fetch(request: Request, env: TestEnv, ctx: ExecutionContext) {
-    const url = new URL(request.url);
-
-    if (url.pathname === '/authorize') {
-      // Mock authorize endpoint
-      const oauthReqInfo = await env.OAUTH_PROVIDER!.parseAuthRequest(request);
-      const clientInfo = await env.OAUTH_PROVIDER!.lookupClient(oauthReqInfo.clientId);
-
-      // Mock user consent flow - automatically grant consent
-      const { redirectTo } = await env.OAUTH_PROVIDER!.completeAuthorization({
-        request: oauthReqInfo,
-        userId: 'test-user-123',
-        metadata: { testConsent: true },
-        scope: oauthReqInfo.scope,
-        props: { userId: 'test-user-123', username: 'TestUser' },
-      });
-
-      return Response.redirect(redirectTo, 302);
-    }
-
-    return new Response('Default handler', { status: 200 });
   },
 };
 
@@ -164,73 +39,84 @@ function createMockRequest(
   return new Request(url, requestInit);
 }
 
-// Create a configured mock environment
-function createMockEnv(): TestEnv {
-  return {
-    OAUTH_KV: new MockKV(),
-    OAUTH_PROVIDER: null, // Will be populated by the OAuthProvider
-  };
-}
-
 describe('OAuthProvider', () => {
-  let oauthProvider: OAuthProvider<TestEnv>;
-  let mockEnv: TestEnv;
-  let mockCtx: MockExecutionContext;
+  let oauthProvider: OAuthProvider;
+  let memoryStore: MemoryStore;
+
+  // Factory to create a default handler that uses a given provider reference
+  function createTestDefaultHandler(getProvider: () => OAuthProvider) {
+    return {
+      async fetch(request: Request) {
+        const url = new URL(request.url);
+        if (url.pathname === '/authorize') {
+          const provider = getProvider();
+          const oauthReqInfo = await provider.parseAuthRequest(request);
+          const { redirectTo } = await provider.completeAuthorization({
+            request: oauthReqInfo,
+            userId: 'test-user-123',
+            metadata: { testConsent: true },
+            scope: oauthReqInfo.scope,
+            props: { userId: 'test-user-123', username: 'TestUser' },
+          });
+          return Response.redirect(redirectTo, 302);
+        }
+        return new Response('Default handler', { status: 200 });
+      },
+    };
+  }
+
+  // Default handler that references the outer oauthProvider
+  const testDefaultHandler = createTestDefaultHandler(() => oauthProvider);
 
   beforeEach(() => {
-    // Reset mocks before each test
     vi.resetAllMocks();
-
-    // Create fresh instances for each test
-    mockEnv = createMockEnv();
-    mockCtx = new MockExecutionContext();
-
-    // Create OAuth provider with test configuration
+    memoryStore = new MemoryStore();
     oauthProvider = new OAuthProvider({
       apiRoute: ['/api/', 'https://api.example.com/'],
-      apiHandler: TestApiHandler,
+      apiHandler: testApiHandler,
       defaultHandler: testDefaultHandler,
       authorizeEndpoint: '/authorize',
       tokenEndpoint: '/oauth/token',
       clientRegistrationEndpoint: '/oauth/register',
       scopesSupported: ['read', 'write', 'profile'],
       accessTokenTTL: 3600,
-      allowImplicitFlow: true, // Enable implicit flow for tests
-      allowTokenExchangeGrant: true, // Enable token exchange for tests
+      allowImplicitFlow: true,
+      allowTokenExchangeGrant: true,
+      allowPlainPKCE: true,
+      refreshTokenTTL: 86400,
+      storage: memoryStore,
     });
-  });
-
-  afterEach(() => {
-    // Clean up KV storage after each test
-    mockEnv.OAUTH_KV.clear();
   });
 
   describe('API Route Configuration', () => {
     it('should support multi-handler configuration with apiHandlers', async () => {
-      // Create handler classes for different API routes
-      class UsersApiHandler extends WorkerEntrypoint<TestEnv> {
-        fetch(request: Request) {
+      // Create handler objects for different API routes
+      const usersApiHandler = {
+        async fetch(request: Request, _ctx: OAuthContext) {
           return new Response('Users API response', { status: 200 });
-        }
-      }
+        },
+      };
 
-      class DocumentsApiHandler extends WorkerEntrypoint<TestEnv> {
-        fetch(request: Request) {
+      const documentsApiHandler = {
+        async fetch(request: Request, _ctx: OAuthContext) {
           return new Response('Documents API response', { status: 200 });
-        }
-      }
+        },
+      };
 
       // Create provider with multi-handler configuration
       const providerWithMultiHandler = new OAuthProvider({
         apiHandlers: {
-          '/api/users/': UsersApiHandler,
-          '/api/documents/': DocumentsApiHandler,
+          '/api/users/': usersApiHandler,
+          '/api/documents/': documentsApiHandler,
         },
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
-        clientRegistrationEndpoint: '/oauth/register', // Important for registering clients in the test
+        clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client and get an access token
@@ -247,7 +133,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await providerWithMultiHandler.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await providerWithMultiHandler.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -260,7 +146,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithMultiHandler.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithMultiHandler.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -279,7 +165,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithMultiHandler.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithMultiHandler.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const accessToken = tokens.access_token;
 
@@ -293,12 +179,12 @@ describe('OAuthProvider', () => {
       });
 
       // Request to Users API should be handled by UsersApiHandler
-      const usersResponse = await providerWithMultiHandler.fetch(usersApiRequest, mockEnv, mockCtx);
+      const usersResponse = await providerWithMultiHandler.fetch(usersApiRequest);
       expect(usersResponse.status).toBe(200);
       expect(await usersResponse.text()).toBe('Users API response');
 
       // Request to Documents API should be handled by DocumentsApiHandler
-      const documentsResponse = await providerWithMultiHandler.fetch(documentsApiRequest, mockEnv, mockCtx);
+      const documentsResponse = await providerWithMultiHandler.fetch(documentsApiRequest);
       expect(documentsResponse.status).toBe(200);
       expect(await documentsResponse.text()).toBe('Documents API response');
     });
@@ -318,6 +204,9 @@ describe('OAuthProvider', () => {
           defaultHandler: testDefaultHandler,
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
       }).toThrow('Cannot use both apiRoute/apiHandler and apiHandlers');
     });
@@ -329,6 +218,9 @@ describe('OAuthProvider', () => {
           defaultHandler: testDefaultHandler,
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
       }).toThrow('Must provide either apiRoute + apiHandler OR apiHandlers');
     });
@@ -337,7 +229,7 @@ describe('OAuthProvider', () => {
   describe('OAuth Metadata Discovery', () => {
     it('should return correct metadata at .well-known/oauth-authorization-server', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(200);
 
@@ -357,16 +249,19 @@ describe('OAuthProvider', () => {
       // Create a provider with implicit flow disabled
       const providerWithoutImplicit = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         allowImplicitFlow: false, // Explicitly disable
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await providerWithoutImplicit.fetch(request, mockEnv, mockCtx);
+      const response = await providerWithoutImplicit.fetch(request);
 
       expect(response.status).toBe(200);
 
@@ -379,16 +274,17 @@ describe('OAuthProvider', () => {
       // Create a provider with plain PKCE disabled
       const providerWithoutPlainPKCE = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         allowPlainPKCE: false, // Enforce S256 only
+        storage: memoryStore,
       });
 
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await providerWithoutPlainPKCE.fetch(request, mockEnv, mockCtx);
+      const response = await providerWithoutPlainPKCE.fetch(request);
 
       expect(response.status).toBe(200);
 
@@ -397,22 +293,33 @@ describe('OAuthProvider', () => {
       expect(metadata.code_challenge_methods_supported).not.toContain('plain');
     });
 
-    it('should include both plain and S256 PKCE methods by default', async () => {
+    it('should only include S256 PKCE method by default', async () => {
+      // Create a provider with default settings (no allowPlainPKCE override)
+      const defaultProvider = new OAuthProvider({
+        apiRoute: ['/api/'],
+        apiHandler: testApiHandler,
+        defaultHandler: testDefaultHandler,
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        storage: memoryStore,
+      });
+
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await defaultProvider.fetch(request);
 
       expect(response.status).toBe(200);
 
       const metadata = await response.json<any>();
-      expect(metadata.code_challenge_methods_supported).toContain('plain');
-      expect(metadata.code_challenge_methods_supported).toContain('S256');
+      expect(metadata.code_challenge_methods_supported).toEqual(['S256']);
+      expect(metadata.code_challenge_methods_supported).not.toContain('plain');
     });
   });
 
   describe('Protected Resource Metadata (RFC 9728)', () => {
     it('should return default metadata at .well-known/oauth-protected-resource', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(200);
 
@@ -427,7 +334,7 @@ describe('OAuthProvider', () => {
     it('should use custom resourceMetadata when provided', async () => {
       const customProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -439,10 +346,13 @@ describe('OAuthProvider', () => {
           bearer_methods_supported: ['header', 'body'],
           resource_name: 'Example API',
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
-      const response = await customProvider.fetch(request, mockEnv, mockCtx);
+      const response = await customProvider.fetch(request);
 
       expect(response.status).toBe(200);
 
@@ -457,7 +367,7 @@ describe('OAuthProvider', () => {
     it('should fall back to top-level scopesSupported when resourceMetadata.scopes_supported is not set', async () => {
       const providerWithPartialMetadata = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -465,10 +375,13 @@ describe('OAuthProvider', () => {
         resourceMetadata: {
           resource: 'https://api.example.com',
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource');
-      const response = await providerWithPartialMetadata.fetch(request, mockEnv, mockCtx);
+      const response = await providerWithPartialMetadata.fetch(request);
 
       const metadata = await response.json<any>();
       expect(metadata.resource).toBe('https://api.example.com');
@@ -481,7 +394,7 @@ describe('OAuthProvider', () => {
         Origin: 'https://client.example.com',
       });
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(200);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
@@ -493,15 +406,18 @@ describe('OAuthProvider', () => {
     it('should derive authorization_servers from tokenEndpoint origin for cross-origin auth', async () => {
       const crossOriginProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: 'https://auth.example.com/authorize',
         tokenEndpoint: 'https://auth.example.com/oauth/token',
         scopesSupported: ['read', 'write'],
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const request = createMockRequest('https://resource.example.com/.well-known/oauth-protected-resource');
-      const response = await crossOriginProvider.fetch(request, mockEnv, mockCtx);
+      const response = await crossOriginProvider.fetch(request);
 
       const metadata = await response.json<any>();
       expect(metadata.resource).toBe('https://resource.example.com');
@@ -518,7 +434,7 @@ describe('OAuthProvider', () => {
         }
       );
 
-      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(preflightRequest);
 
       expect(response.status).toBe(204);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
@@ -544,7 +460,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(201);
 
@@ -557,7 +473,7 @@ describe('OAuthProvider', () => {
       expect(registeredClient.client_name).toBe('Test Client');
 
       // Verify the client was saved to KV
-      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      const savedClient = JSON.parse((await memoryStore.get(`client:${registeredClient.client_id}`))!);
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientId).toBe(registeredClient.client_id);
       // Secret should be stored as a hash
@@ -578,7 +494,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(201);
 
@@ -590,7 +506,7 @@ describe('OAuthProvider', () => {
       expect(registeredClient.token_endpoint_auth_method).toBe('none');
 
       // Verify the client was saved to KV
-      const savedClient = await mockEnv.OAUTH_KV.get(`client:${registeredClient.client_id}`, { type: 'json' });
+      const savedClient = JSON.parse((await memoryStore.get(`client:${registeredClient.client_id}`))!);
       expect(savedClient).not.toBeNull();
       expect(savedClient.clientSecret).toBeUndefined(); // No secret stored
     });
@@ -616,7 +532,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
 
       clientId = client.client_id;
@@ -637,7 +553,7 @@ describe('OAuthProvider', () => {
       );
 
       // The default handler will process this request and generate a redirect
-      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(authRequest);
 
       expect(response.status).toBe(302);
 
@@ -654,7 +570,7 @@ describe('OAuthProvider', () => {
       expect(code).toBeDefined();
 
       // Verify a grant was created in KV
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(1);
     });
 
@@ -668,10 +584,10 @@ describe('OAuthProvider', () => {
       );
 
       // Expect the request to be rejected
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+      await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
       // Verify no grant was created
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(0);
     });
 
@@ -685,10 +601,10 @@ describe('OAuthProvider', () => {
       );
 
       // Expect the request to be rejected
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+      await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
 
       // Verify no grant was created
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(0);
     });
 
@@ -703,10 +619,10 @@ describe('OAuthProvider', () => {
       );
 
       // Expect the request to be rejected
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+      await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
 
       // Verify no grant was created
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(0);
     });
 
@@ -720,10 +636,10 @@ describe('OAuthProvider', () => {
       );
 
       // Expect the request to be rejected
-      await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+      await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
       // Verify no grant was created
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(0);
     });
 
@@ -735,9 +651,7 @@ describe('OAuthProvider', () => {
           `&scope=read&state=xyz123`
       );
 
-      // Manually trigger the fetch to populate env.OAUTH_PROVIDER
-      await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-      const helpers = mockEnv.OAUTH_PROVIDER!;
+      const helpers = oauthProvider;
 
       // Parse the request to get a valid AuthRequest object
       const oauthReqInfo = await helpers.parseAuthRequest(authRequest);
@@ -777,7 +691,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
 
       clientId = client.client_id;
@@ -797,7 +711,7 @@ describe('OAuthProvider', () => {
       );
 
       // The default handler will process this request and generate a redirect
-      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(authRequest);
 
       expect(response.status).toBe(302);
 
@@ -825,24 +739,28 @@ describe('OAuthProvider', () => {
       expect(fragment.get('state')).toBe('xyz123');
 
       // Verify a grant was created in KV
-      const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grants = await memoryStore.list({ prefix: 'grant:' });
       expect(grants.keys.length).toBe(1);
 
       // Verify access token was stored in KV
-      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const tokenEntries = await memoryStore.list({ prefix: 'token:' });
       expect(tokenEntries.keys.length).toBe(1);
     });
 
     it('should reject implicit flow when allowImplicitFlow is disabled', async () => {
       // Create a provider with implicit flow disabled
-      const providerWithoutImplicit = new OAuthProvider({
+      let providerWithoutImplicit!: OAuthProvider;
+      providerWithoutImplicit = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => providerWithoutImplicit),
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         allowImplicitFlow: false, // Explicitly disable
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create an implicit flow authorization request
@@ -858,21 +776,23 @@ describe('OAuthProvider', () => {
       });
 
       // Expect an error response
-      await expect(providerWithoutImplicit.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+      await expect(providerWithoutImplicit.fetch(authRequest)).rejects.toThrow(
         'The implicit grant flow is not enabled for this provider'
       );
     });
 
     it('should reject plain PKCE when allowPlainPKCE is false', async () => {
       // Create a provider with plain PKCE disabled
-      const providerWithoutPlainPKCE = new OAuthProvider({
+      let providerWithoutPlainPKCE!: OAuthProvider;
+      providerWithoutPlainPKCE = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => providerWithoutPlainPKCE),
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         allowPlainPKCE: false, // Enforce S256 only
+        storage: memoryStore,
       });
 
       // Create an authorization request with plain PKCE
@@ -884,21 +804,23 @@ describe('OAuthProvider', () => {
       );
 
       // Expect an error response
-      await expect(providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
+      await expect(providerWithoutPlainPKCE.fetch(authRequest)).rejects.toThrow(
         'The plain PKCE method is not allowed. Use S256 instead.'
       );
     });
 
     it('should accept S256 PKCE when allowPlainPKCE is false', async () => {
       // Create a provider with plain PKCE disabled
-      const providerWithoutPlainPKCE = new OAuthProvider({
+      let providerWithoutPlainPKCE!: OAuthProvider;
+      providerWithoutPlainPKCE = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => providerWithoutPlainPKCE),
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         allowPlainPKCE: false, // Enforce S256 only
+        storage: memoryStore,
       });
 
       // Create a valid S256 code challenge (SHA-256 of 'test_verifier' base64url encoded)
@@ -913,7 +835,7 @@ describe('OAuthProvider', () => {
       );
 
       // This should NOT throw - S256 is allowed
-      const response = await providerWithoutPlainPKCE.fetch(authRequest, mockEnv, mockCtx);
+      const response = await providerWithoutPlainPKCE.fetch(authRequest);
       // The request should be processed by the default handler
       expect(response.status).toBe(302);
     });
@@ -927,7 +849,7 @@ describe('OAuthProvider', () => {
       );
 
       // The default handler will process this request and generate a redirect
-      const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(authRequest);
       const location = response.headers.get('Location')!;
 
       // Parse the fragment to get the access token
@@ -940,7 +862,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
 
@@ -970,7 +892,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
 
       clientId = client.client_id;
@@ -1000,10 +922,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1034,10 +956,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1064,10 +986,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1092,10 +1014,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1123,10 +1045,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1149,10 +1071,10 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid redirect URI');
+          await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid redirect URI');
 
           // Verify no grant was created
-          const grants = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+          const grants = await memoryStore.list({ prefix: 'grant:' });
           expect(grants.keys.length).toBe(0);
         });
       });
@@ -1185,7 +1107,7 @@ describe('OAuthProvider', () => {
             JSON.stringify(clientData)
           );
 
-          const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+          const registerResponse = await oauthProvider.fetch(registerRequest);
           const client = await registerResponse.json<any>();
 
           const authRequest = createMockRequest(
@@ -1194,7 +1116,7 @@ describe('OAuthProvider', () => {
               `&scope=read&state=xyz123`
           );
 
-          const response = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+          const response = await oauthProvider.fetch(authRequest);
 
           // Should get a redirect, not an error
           expect(response.status).toBe(302);
@@ -1212,7 +1134,7 @@ describe('OAuthProvider', () => {
             `&redirect_uri=&scope=read&state=xyz123`
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow();
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow();
       });
 
       it('should reject relative URIs', async () => {
@@ -1233,7 +1155,7 @@ describe('OAuthProvider', () => {
         );
 
         // Should be rejected with "Invalid redirect URI" error
-        const response = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+        const response = await oauthProvider.fetch(registerRequest);
         expect(response.status).toBe(400);
         const errorBody = await response.json<any>();
         expect(errorBody.error).toBe('invalid_client_metadata');
@@ -1262,7 +1184,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
 
       clientId = client.client_id;
@@ -1282,7 +1204,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
@@ -1304,7 +1226,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(200);
 
@@ -1315,13 +1237,13 @@ describe('OAuthProvider', () => {
       expect(tokens.expires_in).toBe(3600);
 
       // Verify token was stored in KV
-      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const tokenEntries = await memoryStore.list({ prefix: 'token:' });
       expect(tokenEntries.keys.length).toBe(1);
 
       // Verify grant was updated (auth code removed, refresh token added)
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
 
       expect(grant.authCodeId).toBeUndefined(); // Auth code should be removed
       expect(grant.refreshTokenId).toBeDefined(); // Refresh token should be added
@@ -1335,7 +1257,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
@@ -1355,14 +1277,14 @@ describe('OAuthProvider', () => {
         params1.toString()
       );
 
-      const tokenResponse1 = await oauthProvider.fetch(tokenRequest1, mockEnv, mockCtx);
+      const tokenResponse1 = await oauthProvider.fetch(tokenRequest1);
       expect(tokenResponse1.status).toBe(200);
 
       const tokens = await tokenResponse1.json<any>();
       expect(tokens.access_token).toBeDefined();
 
       // Verify tokens are in KV
-      const tokensBefore = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const tokensBefore = await memoryStore.list({ prefix: 'token:' });
       expect(tokensBefore.keys.length).toBe(1);
 
       // reuse code: should fail with invalid_grant
@@ -1380,7 +1302,7 @@ describe('OAuthProvider', () => {
         params2.toString()
       );
 
-      const tokenResponse2 = await oauthProvider.fetch(tokenRequest2, mockEnv, mockCtx);
+      const tokenResponse2 = await oauthProvider.fetch(tokenRequest2);
       expect(tokenResponse2.status).toBe(400);
 
       const error = await tokenResponse2.json<any>();
@@ -1388,11 +1310,11 @@ describe('OAuthProvider', () => {
       expect(error.error_description).toBe('Authorization code already used');
 
       // Verify tokens from the first exchange were revoked
-      const tokensAfter = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const tokensAfter = await memoryStore.list({ prefix: 'token:' });
       expect(tokensAfter.keys.length).toBe(0);
 
       // Verify the grant itself was also revoked
-      const grantsAfter = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantsAfter = await memoryStore.list({ prefix: 'grant:' });
       expect(grantsAfter.keys.length).toBe(0);
     });
 
@@ -1404,7 +1326,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
@@ -1424,7 +1346,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       // Should fail because redirect_uri is required when not using PKCE
       expect(tokenResponse.status).toBe(400);
@@ -1441,7 +1363,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
@@ -1462,7 +1384,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       // Should fail because code_verifier is provided but PKCE wasn't used in authorization
       expect(tokenResponse.status).toBe(400);
@@ -1505,7 +1427,7 @@ describe('OAuthProvider', () => {
           `&code_challenge=${codeChallenge}&code_challenge_method=S256`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const url = new URL(location);
       const code = url.searchParams.get('code')!;
@@ -1526,7 +1448,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       // Should succeed because redirect_uri is optional when using PKCE
       expect(tokenResponse.status).toBe(200);
@@ -1546,7 +1468,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -1565,7 +1487,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Now use the access token for an API request
@@ -1573,7 +1495,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${tokens.access_token}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
 
@@ -1590,7 +1512,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write%20profile&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code with narrower scope param
@@ -1609,7 +1531,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       expect(tokenResponse.status).toBe(200);
 
       const tokens = await tokenResponse.json<any>();
@@ -1623,7 +1545,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Request scopes including one not in the grant
@@ -1642,7 +1564,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       expect(tokenResponse.status).toBe(200);
 
       const tokens = await tokenResponse.json<any>();
@@ -1656,7 +1578,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       const params = new URLSearchParams();
@@ -1674,7 +1596,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       expect(tokenResponse.status).toBe(200);
 
       const tokens = await tokenResponse.json<any>();
@@ -1703,7 +1625,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -1716,7 +1638,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -1735,7 +1657,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       refreshToken = tokens.refresh_token;
     }
@@ -1759,7 +1681,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProvider.fetch(refreshRequest);
 
       expect(refreshResponse.status).toBe(200);
 
@@ -1769,13 +1691,13 @@ describe('OAuthProvider', () => {
       expect(newTokens.refresh_token).not.toBe(refreshToken); // Should get a new refresh token
 
       // Verify we now have a new token in storage
-      const tokenEntries = await mockEnv.OAUTH_KV.list({ prefix: 'token:' });
+      const tokenEntries = await memoryStore.list({ prefix: 'token:' });
       expect(tokenEntries.keys.length).toBe(2); // The old one and the new one
 
       // Verify the grant was updated
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
 
       expect(grant.previousRefreshTokenId).toBeDefined(); // Old refresh token should be tracked
       expect(grant.refreshTokenId).toBeDefined(); // New refresh token should be set
@@ -1796,7 +1718,7 @@ describe('OAuthProvider', () => {
         params1.toString()
       );
 
-      const refreshResponse1 = await oauthProvider.fetch(refreshRequest1, mockEnv, mockCtx);
+      const refreshResponse1 = await oauthProvider.fetch(refreshRequest1);
       const newTokens1 = await refreshResponse1.json<any>();
       const newRefreshToken = newTokens1.refresh_token;
 
@@ -1814,7 +1736,7 @@ describe('OAuthProvider', () => {
         params2.toString()
       );
 
-      const refreshResponse2 = await oauthProvider.fetch(refreshRequest2, mockEnv, mockCtx);
+      const refreshResponse2 = await oauthProvider.fetch(refreshRequest2);
 
       // The request should succeed
       expect(refreshResponse2.status).toBe(200);
@@ -1825,9 +1747,9 @@ describe('OAuthProvider', () => {
 
       // Now the grant should have the newest refresh token and the token from the first refresh
       // as the previous token
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
 
       // The previousRefreshTokenId should now be from the first refresh, not the original
       expect(grant.previousRefreshTokenId).toBeDefined();
@@ -1849,7 +1771,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProvider.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200);
 
       const newTokens = await refreshResponse.json<any>();
@@ -1871,7 +1793,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProvider.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200);
 
       const newTokens = await refreshResponse.json<any>();
@@ -1893,7 +1815,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProvider.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200);
 
       const newTokens = await refreshResponse.json<any>();
@@ -1924,7 +1846,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(originalClientData)
       );
 
-      const registerResponse1 = await oauthProvider.fetch(registerRequest1, mockEnv, mockCtx);
+      const registerResponse1 = await oauthProvider.fetch(registerRequest1);
       const originalClient = await registerResponse1.json<any>();
       originalClientId = originalClient.client_id;
       originalClientSecret = originalClient.client_secret;
@@ -1936,7 +1858,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write%20admin&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -1955,7 +1877,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       accessToken = tokens.access_token;
     }
@@ -1975,7 +1897,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -2003,7 +1925,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(200);
 
@@ -2019,14 +1941,14 @@ describe('OAuthProvider', () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
       expect(apiResponse.status).toBe(200);
 
       // Verify original token still works
       const originalApiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const originalApiResponse = await oauthProvider.fetch(originalApiRequest, mockEnv, mockCtx);
+      const originalApiResponse = await oauthProvider.fetch(originalApiRequest);
       expect(originalApiResponse.status).toBe(200);
     });
 
@@ -2048,7 +1970,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(200);
 
@@ -2074,7 +1996,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(200);
 
@@ -2092,7 +2014,7 @@ describe('OAuthProvider', () => {
           `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2110,7 +2032,7 @@ describe('OAuthProvider', () => {
         params1.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const tokenWithResource = tokens.access_token;
 
@@ -2132,7 +2054,7 @@ describe('OAuthProvider', () => {
         params2.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(200);
 
@@ -2148,7 +2070,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&resource=${encodeURIComponent('https://api1.example.com')}&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2166,7 +2088,7 @@ describe('OAuthProvider', () => {
         params1.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const tokenWithResource = tokens.access_token;
 
@@ -2188,7 +2110,7 @@ describe('OAuthProvider', () => {
         params2.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(400);
 
@@ -2214,7 +2136,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(200);
 
@@ -2239,7 +2161,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(400);
 
@@ -2263,7 +2185,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(400);
 
@@ -2288,7 +2210,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(400);
 
@@ -2313,7 +2235,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const exchangeResponse = await oauthProvider.fetch(exchangeRequest, mockEnv, mockCtx);
+      const exchangeResponse = await oauthProvider.fetch(exchangeRequest);
 
       expect(exchangeResponse.status).toBe(400);
 
@@ -2322,7 +2244,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should exchange token via OAuthHelpers.exchangeToken', async () => {
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       const newToken = await helpers.exchangeToken({
         subjectToken: accessToken,
@@ -2335,7 +2257,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should exchange token via OAuthHelpers with narrowed scopes', async () => {
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       const newToken = await helpers.exchangeToken({
         subjectToken: accessToken,
@@ -2354,7 +2276,7 @@ describe('OAuthProvider', () => {
           `&resource=${encodeURIComponent('https://api2.example.com')}&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2372,11 +2294,11 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const tokenWithResource = tokens.access_token;
 
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       const newToken = await helpers.exchangeToken({
         subjectToken: tokenWithResource,
@@ -2387,7 +2309,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should exchange token via OAuthHelpers with custom TTL', async () => {
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       const newToken = await helpers.exchangeToken({
         subjectToken: accessToken,
@@ -2398,7 +2320,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should reject OAuthHelpers.exchangeToken with invalid token', async () => {
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       await expect(
         helpers.exchangeToken({
@@ -2408,7 +2330,7 @@ describe('OAuthProvider', () => {
     });
 
     it('should silently remove invalid scopes from OAuthHelpers.exchangeToken', async () => {
-      const helpers = mockEnv.OAUTH_PROVIDER as OAuthHelpers;
+      const helpers = oauthProvider as OAuthHelpers;
 
       const tokenResponse = await helpers.exchangeToken({
         subjectToken: accessToken,
@@ -2425,7 +2347,7 @@ describe('OAuthProvider', () => {
 
       const providerWithCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -2438,6 +2360,9 @@ describe('OAuthProvider', () => {
             accessTokenProps: { ...options.props, exchanged: true },
           };
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Get a token with this provider
@@ -2447,7 +2372,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2465,7 +2390,7 @@ describe('OAuthProvider', () => {
         params1.toString()
       );
 
-      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const tokenToExchange = tokens.access_token;
 
@@ -2490,7 +2415,7 @@ describe('OAuthProvider', () => {
         params2.toString()
       );
 
-      await providerWithCallback.fetch(exchangeRequest, mockEnv, mockCtx);
+      await providerWithCallback.fetch(exchangeRequest);
 
       expect(callbackInvoked).toBe(true);
       expect(callbackOptions).toBeDefined();
@@ -2520,7 +2445,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -2531,13 +2456,15 @@ describe('OAuthProvider', () => {
       // Create provider with refreshTokenTTL = 0 (no refresh tokens)
       const providerNoRefresh = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         accessTokenTTL: 3600,
         refreshTokenTTL: 0, // No refresh tokens
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get an auth code
@@ -2547,7 +2474,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerNoRefresh.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerNoRefresh.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2566,7 +2493,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerNoRefresh.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerNoRefresh.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Should have access token but no refresh token
@@ -2579,7 +2506,7 @@ describe('OAuthProvider', () => {
       // Create provider with globally disabled refresh tokens, but callback can enable them
       const providerWithCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -2596,6 +2523,8 @@ describe('OAuthProvider', () => {
           }
           return {};
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get an auth code
@@ -2605,7 +2534,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2624,7 +2553,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Should have both access token AND refresh token (callback enabled it)
@@ -2633,9 +2562,9 @@ describe('OAuthProvider', () => {
       expect(tokens.refresh_token).toBeDefined(); // Callback override worked!
 
       // Verify the grant has the correct TTL
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
       expect(grant.expiresAt).toBeDefined();
       const now = Math.floor(Date.now() / 1000);
       expect(grant.expiresAt).toBeGreaterThan(now);
@@ -2645,7 +2574,7 @@ describe('OAuthProvider', () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${tokens.access_token}`,
       });
-      const apiResponse = await providerWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithCallback.fetch(apiRequest);
       const apiData = await apiResponse.json<any>();
       expect(apiData.user.specialUser).toBe(true);
     });
@@ -2654,13 +2583,15 @@ describe('OAuthProvider', () => {
       // Create provider with refresh token TTL
       const providerWithTTL = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         accessTokenTTL: 3600,
         refreshTokenTTL: 7200, // 2 hours
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get an auth code
@@ -2670,7 +2601,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithTTL.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2689,13 +2620,13 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithTTL.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Check that the grant has the refresh token expiration set
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
 
       expect(grant.expiresAt).toBeDefined();
       const now = Math.floor(Date.now() / 1000);
@@ -2705,15 +2636,18 @@ describe('OAuthProvider', () => {
 
     it('should reject expired refresh tokens', async () => {
       // Create provider with very short refresh token TTL
-      const providerWithShortTTL = new OAuthProvider({
+      let providerWithShortTTL!: OAuthProvider;
+      providerWithShortTTL = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
-        defaultHandler: testDefaultHandler,
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => providerWithShortTTL),
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         accessTokenTTL: 3600,
         refreshTokenTTL: 1, // 1 second - very short for testing
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get an auth code
@@ -2723,7 +2657,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithShortTTL.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithShortTTL.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2742,7 +2676,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithShortTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithShortTTL.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const refreshToken = tokens.refresh_token;
 
@@ -2763,19 +2697,19 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await providerWithShortTTL.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await providerWithShortTTL.fetch(refreshRequest);
 
       expect(refreshResponse.status).toBe(400);
       const error = await refreshResponse.json<any>();
       expect(error.error).toBe('invalid_grant');
-      expect(error.error_description).toBe('Refresh token has expired');
+      expect(error.error_description).toBe('Grant not found');
     });
 
     it('should allow overriding refresh token TTL via callback', async () => {
       // Create provider with callback that sets custom TTL
       const providerWithCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -2789,6 +2723,8 @@ describe('OAuthProvider', () => {
           }
           return {};
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get an auth code
@@ -2798,7 +2734,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2817,13 +2753,13 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithCallback.fetch(tokenRequest);
       await tokenResponse.json<any>();
 
       // Check that the grant has the custom TTL
-      const grantEntries = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries.keys[0].name;
-      const grant = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant = JSON.parse((await memoryStore.get(grantKey))!);
 
       expect(grant.expiresAt).toBeDefined();
       const now = Math.floor(Date.now() / 1000);
@@ -2836,13 +2772,15 @@ describe('OAuthProvider', () => {
       // Create provider with refresh token TTL
       const providerWithTTL = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         accessTokenTTL: 3600,
         refreshTokenTTL: 7200, // 2 hours
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get initial tokens
@@ -2852,7 +2790,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithTTL.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithTTL.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2870,13 +2808,13 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithTTL.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithTTL.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Get the original expiration time
-      const grantEntries1 = await mockEnv.OAUTH_KV.list({ prefix: 'grant:' });
+      const grantEntries1 = await memoryStore.list({ prefix: 'grant:' });
       const grantKey = grantEntries1.keys[0].name;
-      const grant1 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant1 = JSON.parse((await memoryStore.get(grantKey))!);
       const originalExpiration = grant1.expiresAt;
 
       // Do a refresh without specifying new TTL
@@ -2893,11 +2831,11 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await providerWithTTL.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await providerWithTTL.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200);
 
       // Check that expiration is preserved
-      const grant2 = await mockEnv.OAUTH_KV.get(grantKey, { type: 'json' });
+      const grant2 = JSON.parse((await memoryStore.get(grantKey))!);
       expect(grant2.expiresAt).toBe(originalExpiration);
     });
 
@@ -2905,7 +2843,7 @@ describe('OAuthProvider', () => {
       // Create provider with callback that tries to change TTL during refresh
       const providerWithBadCallback = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -2919,6 +2857,8 @@ describe('OAuthProvider', () => {
           }
           return {};
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
       });
 
       // Get initial tokens through the full flow
@@ -2928,7 +2868,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithBadCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithBadCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -2946,7 +2886,7 @@ describe('OAuthProvider', () => {
         tokenParams.toString()
       );
 
-      const tokenResponse = await providerWithBadCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithBadCallback.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       expect(tokens.refresh_token).toBeDefined();
 
@@ -2964,7 +2904,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await providerWithBadCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await providerWithBadCallback.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(400);
 
       const error = await refreshResponse.json<any>();
@@ -2992,7 +2932,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3005,7 +2945,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3024,7 +2964,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       accessToken = tokens.access_token;
     }
@@ -3036,7 +2976,7 @@ describe('OAuthProvider', () => {
     it('should reject API requests without a token', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test');
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
 
@@ -3047,7 +2987,7 @@ describe('OAuthProvider', () => {
     it('should include resource_metadata in WWW-Authenticate header on 401 (RFC 9728)', async () => {
       const apiRequest = createMockRequest('https://example.com/api/test');
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
 
@@ -3062,7 +3002,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer invalid-token',
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
 
@@ -3075,7 +3015,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
 
@@ -3102,7 +3042,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3115,7 +3055,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3142,7 +3082,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<{ access_token: string }>();
       return tokens.access_token;
     }
@@ -3154,7 +3094,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3169,7 +3109,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<{ success: boolean }>();
@@ -3184,7 +3124,7 @@ describe('OAuthProvider', () => {
       const api1Request = createMockRequest('https://api1.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api1Response = await oauthProvider.fetch(api1Request, mockEnv, mockCtx);
+      const api1Response = await oauthProvider.fetch(api1Request);
       expect(api1Response.status).toBe(200);
       const api1Data = await api1Response.json<{ success: boolean }>();
       expect(api1Data.success).toBe(true);
@@ -3193,7 +3133,7 @@ describe('OAuthProvider', () => {
       const api2Request = createMockRequest('https://api2.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api2Response = await oauthProvider.fetch(api2Request, mockEnv, mockCtx);
+      const api2Response = await oauthProvider.fetch(api2Request);
       expect(api2Response.status).toBe(200);
       const api2Data = await api2Response.json<{ success: boolean }>();
       expect(api2Data.success).toBe(true);
@@ -3202,7 +3142,7 @@ describe('OAuthProvider', () => {
       const api3Request = createMockRequest('https://api3.example.com/api/test', 'GET', {
         Authorization: `Bearer ${accessToken}`,
       });
-      const api3Response = await oauthProvider.fetch(api3Request, mockEnv, mockCtx);
+      const api3Response = await oauthProvider.fetch(api3Request);
       expect(api3Response.status).toBe(401);
       const api3Error = await api3Response.json<{ error: string }>();
       expect(api3Error.error).toBe('invalid_token');
@@ -3215,7 +3155,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<{ success: boolean }>();
@@ -3229,7 +3169,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
 
@@ -3251,7 +3191,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
 
@@ -3266,7 +3206,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<{ error: string; error_description: string }>();
@@ -3280,7 +3220,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<{ error: string; error_description: string }>();
@@ -3296,7 +3236,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3312,7 +3252,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3326,7 +3266,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3348,7 +3288,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3361,7 +3301,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3381,7 +3321,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(400);
       const error = await tokenResponse.json<any>();
@@ -3404,7 +3344,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3417,7 +3357,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3437,7 +3377,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(400);
       const error = await tokenResponse.json<any>();
@@ -3459,7 +3399,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3472,7 +3412,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3492,7 +3432,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(400);
       const error = await tokenResponse.json<any>();
@@ -3514,7 +3454,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3528,7 +3468,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3548,7 +3488,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       expect(tokenResponse.status).toBe(200);
       const tokens = await tokenResponse.json<any>();
       const accessToken = tokens.access_token;
@@ -3558,7 +3498,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
       expect(data.success).toBe(true);
@@ -3567,7 +3507,7 @@ describe('OAuthProvider', () => {
     it('should validate audience for external tokens with matching audience', async () => {
       const externalProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -3582,13 +3522,16 @@ describe('OAuthProvider', () => {
           }
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: 'Bearer external-token-with-audience',
       });
 
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await externalProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3598,7 +3541,7 @@ describe('OAuthProvider', () => {
     it('should reject external tokens with wrong audience', async () => {
       const externalProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -3613,13 +3556,16 @@ describe('OAuthProvider', () => {
           }
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: 'Bearer external-token-wrong-audience',
       });
 
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await externalProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3636,7 +3582,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3650,7 +3596,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3661,7 +3607,7 @@ describe('OAuthProvider', () => {
     it('should accept external token with path-aware audience at matching path (RFC 8707)', async () => {
       const externalProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -3676,13 +3622,16 @@ describe('OAuthProvider', () => {
           }
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: 'Bearer external-token-path-audience',
       });
 
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await externalProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3692,7 +3641,7 @@ describe('OAuthProvider', () => {
     it('should reject external token with path-aware audience at different path (RFC 8707)', async () => {
       const externalProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -3707,13 +3656,16 @@ describe('OAuthProvider', () => {
           }
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const apiRequest = createMockRequest('https://example.com/api/other', 'GET', {
         Authorization: 'Bearer external-token-path-mismatch',
       });
 
-      const apiResponse = await externalProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await externalProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3728,7 +3680,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3744,7 +3696,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -3759,7 +3711,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3773,7 +3725,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${accessToken}`,
       });
 
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const data = await apiResponse.json<any>();
@@ -3797,7 +3749,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3810,7 +3762,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123&resource=https://api1.example.com`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3830,7 +3782,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(400);
       const error = await tokenResponse.json<any>();
@@ -3853,7 +3805,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3867,7 +3819,7 @@ describe('OAuthProvider', () => {
           `&resource=https://api1.example.com&resource=https://api2.example.com`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3887,7 +3839,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(200);
       const tokens = await tokenResponse.json<any>();
@@ -3904,7 +3856,7 @@ describe('OAuthProvider', () => {
         'Access-Control-Request-Headers': 'Authorization',
       });
 
-      const preflightResponse = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+      const preflightResponse = await oauthProvider.fetch(preflightRequest);
 
       expect(preflightResponse.status).toBe(204);
       expect(preflightResponse.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
@@ -3917,7 +3869,7 @@ describe('OAuthProvider', () => {
         Origin: 'https://client.example.com',
       });
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(200);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
@@ -3936,7 +3888,7 @@ describe('OAuthProvider', () => {
         }
       );
 
-      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(preflightRequest);
 
       expect(response.status).toBe(204);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://spa.example.com');
@@ -3961,7 +3913,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await oauthProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -3973,7 +3925,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -3995,7 +3947,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
 
       expect(tokenResponse.status).toBe(200);
       expect(tokenResponse.headers.get('Access-Control-Allow-Origin')).toBe('https://webapp.example.com');
@@ -4011,7 +3963,7 @@ describe('OAuthProvider', () => {
         'Access-Control-Request-Headers': 'Content-Type',
       });
 
-      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(preflightRequest);
 
       expect(response.status).toBe(204);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://mobile.example.com');
@@ -4037,7 +3989,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(201);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://admin.example.com');
@@ -4052,7 +4004,7 @@ describe('OAuthProvider', () => {
         'Access-Control-Request-Headers': 'Content-Type, Authorization',
       });
 
-      const response = await oauthProvider.fetch(preflightRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(preflightRequest);
 
       expect(response.status).toBe(204);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://dashboard.example.com');
@@ -4062,7 +4014,7 @@ describe('OAuthProvider', () => {
 
     it('should not add CORS headers when no Origin header is present', async () => {
       const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server');
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
 
       expect(response.status).toBe(200);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
@@ -4076,7 +4028,7 @@ describe('OAuthProvider', () => {
         // No Authorization header - should get 401 error with CORS headers
       });
 
-      const response = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(apiRequest);
 
       expect(response.status).toBe(401);
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://client.example.com');
@@ -4103,7 +4055,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const response = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(tokenRequest);
 
       expect(response.status).toBe(401); // Should be an error
       expect(response.headers.get('Access-Control-Allow-Origin')).toBe('https://evil.example.com');
@@ -4116,7 +4068,7 @@ describe('OAuthProvider', () => {
         Origin: 'https://client.example.com',
       });
 
-      const response = await oauthProvider.fetch(defaultRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(defaultRequest);
 
       expect(response.status).toBe(200);
       // CORS headers should NOT be added to default handler responses
@@ -4128,10 +4080,8 @@ describe('OAuthProvider', () => {
 
   describe('Token Exchange Callback', () => {
     // Test with provider that has token exchange callback
-    let oauthProviderWithCallback: OAuthProvider<TestEnv>;
+    let oauthProviderWithCallback: OAuthProvider;
     let callbackInvocations: any[] = [];
-    let mockEnv: TestEnv;
-    let mockCtx: MockExecutionContext;
 
     // Helper function to create a test OAuth provider with a token exchange callback
     function createProviderWithCallback() {
@@ -4172,7 +4122,7 @@ describe('OAuthProvider', () => {
 
       return new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -4181,6 +4131,9 @@ describe('OAuthProvider', () => {
         accessTokenTTL: 3600,
         allowImplicitFlow: true,
         tokenExchangeCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
     }
 
@@ -4203,7 +4156,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProviderWithCallback.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProviderWithCallback.fetch(request);
       const client = await response.json<any>();
 
       clientId = client.client_id;
@@ -4212,23 +4165,17 @@ describe('OAuthProvider', () => {
     }
 
     beforeEach(async () => {
-      // Reset mocks before each test
       vi.resetAllMocks();
-
-      // Create fresh instances for each test
-      mockEnv = createMockEnv();
-      mockCtx = new MockExecutionContext();
+      memoryStore = new MemoryStore();
 
       // Create OAuth provider with test configuration and callback
       oauthProviderWithCallback = createProviderWithCallback();
 
+      // Re-create oauthProvider to use the same memoryStore so testDefaultHandler works
+      oauthProvider = oauthProviderWithCallback;
+
       // Create a test client
       await createTestClient();
-    });
-
-    afterEach(() => {
-      // Clean up KV storage after each test
-      mockEnv.OAUTH_KV.clear();
     });
 
     it('should call the callback during authorization code flow', async () => {
@@ -4239,7 +4186,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProviderWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProviderWithCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -4261,7 +4208,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest);
 
       // Check that the token exchange was successful
       expect(tokenResponse.status).toBe(200);
@@ -4282,7 +4229,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${tokens.access_token}`,
       });
 
-      const apiResponse = await oauthProviderWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProviderWithCallback.fetch(apiRequest);
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the callback
@@ -4303,7 +4250,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await oauthProviderWithCallback.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProviderWithCallback.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -4322,7 +4269,7 @@ describe('OAuthProvider', () => {
         codeParams.toString()
       );
 
-      const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProviderWithCallback.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Reset the callback invocations tracking before refresh
@@ -4342,7 +4289,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await oauthProviderWithCallback.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProviderWithCallback.fetch(refreshRequest);
 
       // Check that the refresh was successful
       expect(refreshResponse.status).toBe(200);
@@ -4369,7 +4316,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const apiResponse = await oauthProviderWithCallback.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProviderWithCallback.fetch(apiRequest);
       expect(apiResponse.status).toBe(200);
 
       // Check that the API received the token-specific props from the refresh callback
@@ -4399,7 +4346,7 @@ describe('OAuthProvider', () => {
         refresh2Params.toString()
       );
 
-      const refresh2Response = await oauthProviderWithCallback.fetch(refresh2Request, mockEnv, mockCtx);
+      const refresh2Response = await oauthProviderWithCallback.fetch(refresh2Request);
       const newerTokens = await refresh2Response.json();
 
       // Check that the refresh count was incremented in the grant props
@@ -4429,13 +4376,16 @@ describe('OAuthProvider', () => {
 
       const refreshPropsProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
         tokenExchangeCallback: differentPropsCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client
@@ -4452,7 +4402,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await refreshPropsProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await refreshPropsProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
@@ -4465,7 +4415,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await refreshPropsProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await refreshPropsProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange for tokens
@@ -4483,7 +4433,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await refreshPropsProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await refreshPropsProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Now do a refresh token exchange
@@ -4500,7 +4450,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await refreshPropsProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await refreshPropsProvider.fetch(refreshRequest);
       const newTokens = await refreshResponse.json<any>();
 
       // Use the new token to access API
@@ -4508,7 +4458,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const apiResponse = await refreshPropsProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await refreshPropsProvider.fetch(apiRequest);
       const apiData = await apiResponse.json<any>();
 
       // The access token should contain the token-specific props from the refresh callback
@@ -4536,13 +4486,16 @@ describe('OAuthProvider', () => {
 
       const specialProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
         tokenExchangeCallback: propsCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client
@@ -4559,7 +4512,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await specialProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await specialProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
@@ -4572,7 +4525,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await specialProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await specialProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code for tokens
@@ -4590,7 +4543,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await specialProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await specialProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Verify the token has the tokenOnly property when used for API access
@@ -4598,7 +4551,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${tokens.access_token}`,
       });
 
-      const apiResponse = await specialProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await specialProvider.fetch(apiRequest);
       const apiData = await apiResponse.json<any>();
       expect(apiData.user.tokenOnly).toBe(true);
 
@@ -4616,7 +4569,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await specialProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await specialProvider.fetch(refreshRequest);
       const newTokens = await refreshResponse.json<any>();
 
       // Use the new token to access API
@@ -4624,7 +4577,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const api2Response = await specialProvider.fetch(api2Request, mockEnv, mockCtx);
+      const api2Response = await specialProvider.fetch(api2Request);
       const api2Data = await api2Response.json<any>();
 
       // With the enhanced implementation, the token props now inherit from grant props
@@ -4651,7 +4604,7 @@ describe('OAuthProvider', () => {
 
       const customTtlProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -4659,6 +4612,9 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write'],
         accessTokenTTL: 3600, // Default 1 hour
         tokenExchangeCallback: customTtlCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client
@@ -4675,7 +4631,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await customTtlProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await customTtlProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
@@ -4688,7 +4644,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await customTtlProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await customTtlProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code for tokens
@@ -4706,7 +4662,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await customTtlProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await customTtlProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Now do a refresh
@@ -4723,7 +4679,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await customTtlProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await customTtlProvider.fetch(refreshRequest);
       const newTokens = await refreshResponse.json<any>();
 
       // Verify that the TTL is from the callback, not the default
@@ -4734,7 +4690,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const apiResponse = await customTtlProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await customTtlProvider.fetch(apiRequest);
       const apiData = await apiResponse.json<any>();
       expect(apiData.user.customTtl).toBe(true);
     });
@@ -4748,13 +4704,16 @@ describe('OAuthProvider', () => {
 
       const noopProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
         tokenExchangeCallback: noopCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client
@@ -4771,7 +4730,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await noopProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await noopProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
@@ -4784,7 +4743,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await noopProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await noopProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code for tokens
@@ -4802,7 +4761,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await noopProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await noopProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
 
       // Verify the token has the original props when used for API access
@@ -4810,7 +4769,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${tokens.access_token}`,
       });
 
-      const apiResponse = await noopProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await noopProvider.fetch(apiRequest);
       const apiData = await apiResponse.json<any>();
 
       // The props should be the original ones (no change)
@@ -4842,13 +4801,16 @@ describe('OAuthProvider', () => {
 
       const testProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
         tokenExchangeCallback: propUpdatingCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a client
@@ -4865,7 +4827,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await testProvider.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await testProvider.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const testClientId = client.client_id;
       const testClientSecret = client.client_secret;
@@ -4878,7 +4840,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await testProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await testProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code for tokens
@@ -4896,7 +4858,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await testProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await testProvider.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const refreshToken = tokens.refresh_token;
 
@@ -4917,7 +4879,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString()
       );
 
-      const refreshResponse = await testProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await testProvider.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200);
 
       // The callback should have been called once for the refresh
@@ -4931,7 +4893,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${newTokens.access_token}`,
       });
 
-      const apiResponse1 = await testProvider.fetch(apiRequest1, mockEnv, mockCtx);
+      const apiResponse1 = await testProvider.fetch(apiRequest1);
       const apiData1 = await apiResponse1.json<any>();
 
       // Print the actual API response to debug
@@ -4952,7 +4914,7 @@ describe('OAuthProvider', () => {
         refreshParams.toString() // Using same params with the same refresh token
       );
 
-      const secondRefreshResponse = await testProvider.fetch(secondRefreshRequest, mockEnv, mockCtx);
+      const secondRefreshResponse = await testProvider.fetch(secondRefreshRequest);
 
       // With the bug, this would fail with an error.
       // When fixed, it should succeed because the previous refresh token is still valid once.
@@ -4969,7 +4931,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${secondTokens.access_token}`,
       });
 
-      const apiResponse2 = await testProvider.fetch(apiRequest2, mockEnv, mockCtx);
+      const apiResponse2 = await testProvider.fetch(apiRequest2);
       const apiData2 = await apiResponse2.json<any>();
 
       // The updatedCount should be 2 now (incremented again during the second refresh)
@@ -4988,13 +4950,16 @@ describe('OAuthProvider', () => {
 
       const scopeProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'profile'],
         tokenExchangeCallback: scopeCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Register client
@@ -5008,7 +4973,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         })
       );
-      const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
+      const regRes = await scopeProvider.fetch(regReq);
       const client = await regRes.json<any>();
 
       // Authorize with broad scopes
@@ -5017,7 +4982,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
           `&scope=read%20write%20profile&state=xyz`
       );
-      const authRes = await scopeProvider.fetch(authReq, mockEnv, mockCtx);
+      const authRes = await scopeProvider.fetch(authReq);
       const code = new URL(authRes.headers.get('Location')!).searchParams.get('code')!;
 
       // Exchange code
@@ -5035,7 +5000,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenRes = await scopeProvider.fetch(tokenReq, mockEnv, mockCtx);
+      const tokenRes = await scopeProvider.fetch(tokenReq);
       expect(tokenRes.status).toBe(200);
       const tokens = await tokenRes.json<any>();
       // Callback forced scope to 'read' only
@@ -5056,13 +5021,16 @@ describe('OAuthProvider', () => {
 
       const scopeProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write'],
         tokenExchangeCallback: scopeCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Register client
@@ -5076,7 +5044,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         })
       );
-      const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
+      const regRes = await scopeProvider.fetch(regReq);
       const client = await regRes.json<any>();
 
       // Get tokens via auth code
@@ -5085,7 +5053,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
           `&scope=read%20write&state=xyz`
       );
-      const authRes = await scopeProvider.fetch(authReq, mockEnv, mockCtx);
+      const authRes = await scopeProvider.fetch(authReq);
       const code = new URL(authRes.headers.get('Location')!).searchParams.get('code')!;
 
       const codeParams = new URLSearchParams();
@@ -5101,9 +5069,7 @@ describe('OAuthProvider', () => {
           'POST',
           { 'Content-Type': 'application/x-www-form-urlencoded' },
           codeParams.toString()
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
       const tokens = await tokenRes.json<any>();
       expect(tokens.scope).toBe('read write'); // No callback for auth_code, full scopes
@@ -5121,9 +5087,7 @@ describe('OAuthProvider', () => {
           'POST',
           { 'Content-Type': 'application/x-www-form-urlencoded' },
           refreshParams.toString()
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
       expect(refreshRes.status).toBe(200);
       const newTokens = await refreshRes.json<any>();
@@ -5144,7 +5108,7 @@ describe('OAuthProvider', () => {
 
       const scopeProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5152,6 +5116,9 @@ describe('OAuthProvider', () => {
         scopesSupported: ['read', 'write', 'profile'],
         allowTokenExchangeGrant: true,
         tokenExchangeCallback: scopeCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Register original client
@@ -5165,7 +5132,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         })
       );
-      const regRes1 = await scopeProvider.fetch(regReq1, mockEnv, mockCtx);
+      const regRes1 = await scopeProvider.fetch(regReq1);
       const origClient = await regRes1.json<any>();
 
       // Register exchange client
@@ -5179,7 +5146,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         })
       );
-      const regRes2 = await scopeProvider.fetch(regReq2, mockEnv, mockCtx);
+      const regRes2 = await scopeProvider.fetch(regReq2);
       const exchClient = await regRes2.json<any>();
 
       // Get a token with broad scopes
@@ -5188,7 +5155,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent('https://original.example.com/callback')}` +
           `&scope=read%20write%20profile&state=xyz`
       );
-      const authRes = await scopeProvider.fetch(authReq, mockEnv, mockCtx);
+      const authRes = await scopeProvider.fetch(authReq);
       const code = new URL(authRes.headers.get('Location')!).searchParams.get('code')!;
 
       const codeParams = new URLSearchParams();
@@ -5204,9 +5171,7 @@ describe('OAuthProvider', () => {
           'POST',
           { 'Content-Type': 'application/x-www-form-urlencoded' },
           codeParams.toString()
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
       const tokens = await tokenRes.json<any>();
 
@@ -5227,9 +5192,7 @@ describe('OAuthProvider', () => {
             Authorization: `Basic ${btoa(`${exchClient.client_id}:${exchClient.client_secret}`)}`,
           },
           exchParams.toString()
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
       expect(exchRes.status).toBe(200);
       const newTokens = await exchRes.json<any>();
@@ -5247,13 +5210,16 @@ describe('OAuthProvider', () => {
 
       const scopeProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         clientRegistrationEndpoint: '/oauth/register',
         scopesSupported: ['read', 'write', 'admin'],
         tokenExchangeCallback: scopeCallback,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Register client
@@ -5267,7 +5233,7 @@ describe('OAuthProvider', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         })
       );
-      const regRes = await scopeProvider.fetch(regReq, mockEnv, mockCtx);
+      const regRes = await scopeProvider.fetch(regReq);
       const client = await regRes.json<any>();
 
       // Authorize with 'read write' only (not admin)
@@ -5276,7 +5242,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
           `&scope=read%20write&state=xyz`
       );
-      const authRes = await scopeProvider.fetch(authReq, mockEnv, mockCtx);
+      const authRes = await scopeProvider.fetch(authReq);
       const code = new URL(authRes.headers.get('Location')!).searchParams.get('code')!;
 
       const params = new URLSearchParams();
@@ -5292,9 +5258,7 @@ describe('OAuthProvider', () => {
           'POST',
           { 'Content-Type': 'application/x-www-form-urlencoded' },
           params.toString()
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
       expect(tokenRes.status).toBe(200);
       const tokens = await tokenRes.json<any>();
@@ -5314,7 +5278,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer invalid-token',
       });
 
-      const response = await oauthProvider.fetch(invalidTokenRequest, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(invalidTokenRequest);
 
       // Verify the error response
       expect(response.status).toBe(401);
@@ -5332,7 +5296,7 @@ describe('OAuthProvider', () => {
       // Create a provider with custom onError callback
       const customErrorProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5354,6 +5318,9 @@ describe('OAuthProvider', () => {
             }
           );
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a request that will trigger an error
@@ -5361,7 +5328,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer invalid-token',
       });
 
-      const response = await customErrorProvider.fetch(invalidTokenRequest, mockEnv, mockCtx);
+      const response = await customErrorProvider.fetch(invalidTokenRequest);
 
       // Verify the custom error response
       expect(response.status).toBe(401); // Status should be preserved
@@ -5378,7 +5345,7 @@ describe('OAuthProvider', () => {
       let callbackInvoked = false;
       const sideEffectProvider = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5387,6 +5354,9 @@ describe('OAuthProvider', () => {
           callbackInvoked = true;
           // No return - should use standard error response
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Create a request that will trigger an error
@@ -5394,7 +5364,7 @@ describe('OAuthProvider', () => {
         'Content-Type': 'application/x-www-form-urlencoded',
       });
 
-      const response = await sideEffectProvider.fetch(invalidRequest, mockEnv, mockCtx);
+      const response = await sideEffectProvider.fetch(invalidRequest);
 
       // Verify the standard error response
       expect(response.status).toBe(401);
@@ -5422,10 +5392,10 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      await oauthProvider.fetch(registerRequest, mockEnv, mockCtx);
+      await oauthProvider.fetch(registerRequest);
 
       // Create a grant by going through auth flow
-      const clientId = (await mockEnv.OAUTH_KV.list({ prefix: 'client:' })).keys[0].name.substring(7);
+      const clientId = (await memoryStore.list({ prefix: 'client:' })).keys[0].name.substring(7);
       const redirectUri = 'https://client.example.com/callback';
 
       const authRequest = createMockRequest(
@@ -5434,13 +5404,10 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
-
-      // Ensure OAUTH_PROVIDER was injected
-      expect(mockEnv.OAUTH_PROVIDER).not.toBeNull();
+      await oauthProvider.fetch(authRequest);
 
       // List grants for the user
-      const grants = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      const grants = await oauthProvider.listUserGrants('test-user-123');
 
       expect(grants.items.length).toBe(1);
       expect(grants.items[0].clientId).toBe(clientId);
@@ -5448,23 +5415,16 @@ describe('OAuthProvider', () => {
       expect(grants.items[0].metadata).toEqual({ testConsent: true });
 
       // Revoke the grant
-      await mockEnv.OAUTH_PROVIDER!.revokeGrant(grants.items[0].id, 'test-user-123');
+      await oauthProvider.revokeGrant(grants.items[0].id, 'test-user-123');
 
       // Verify grant was deleted
-      const grantsAfterRevoke = await mockEnv.OAUTH_PROVIDER!.listUserGrants('test-user-123');
+      const grantsAfterRevoke = await oauthProvider.listUserGrants('test-user-123');
       expect(grantsAfterRevoke.items.length).toBe(0);
     });
 
     it('should allow listing, updating, and deleting clients', async () => {
-      // First make a simple request to initialize the OAUTH_PROVIDER in the environment
-      const initRequest = createMockRequest('https://example.com/');
-      await oauthProvider.fetch(initRequest, mockEnv, mockCtx);
-
-      // Now OAUTH_PROVIDER should be initialized
-      expect(mockEnv.OAUTH_PROVIDER).not.toBeNull();
-
       // Create a client
-      const client = await mockEnv.OAUTH_PROVIDER!.createClient({
+      const client = await oauthProvider.createClient({
         redirectUris: ['https://client.example.com/callback'],
         clientName: 'Test Client',
         tokenEndpointAuthMethod: 'client_secret_basic',
@@ -5474,12 +5434,12 @@ describe('OAuthProvider', () => {
       expect(client.clientSecret).toBeDefined();
 
       // List clients
-      const clients = await mockEnv.OAUTH_PROVIDER!.listClients();
+      const clients = await oauthProvider.listClients();
       expect(clients.items.length).toBe(1);
       expect(clients.items[0].clientId).toBe(client.clientId);
 
       // Update client
-      const updatedClient = await mockEnv.OAUTH_PROVIDER!.updateClient(client.clientId, {
+      const updatedClient = await oauthProvider.updateClient(client.clientId, {
         clientName: 'Updated Client Name',
       });
 
@@ -5487,10 +5447,10 @@ describe('OAuthProvider', () => {
       expect(updatedClient!.clientName).toBe('Updated Client Name');
 
       // Delete client
-      await mockEnv.OAUTH_PROVIDER!.deleteClient(client.clientId);
+      await oauthProvider.deleteClient(client.clientId);
 
       // Verify client was deleted
-      const clientsAfterDelete = await mockEnv.OAUTH_PROVIDER!.listClients();
+      const clientsAfterDelete = await oauthProvider.listClients();
       expect(clientsAfterDelete.items.length).toBe(0);
     });
   });
@@ -5500,12 +5460,15 @@ describe('OAuthProvider', () => {
       // Create a provider without external token resolution
       const providerWithoutExternalValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
         scopesSupported: ['read', 'write'],
         // Intentionally no resolveExternalToken callback
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Try to access API with an unknown token format
@@ -5513,7 +5476,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer external-token-from-another-service',
       });
 
-      const apiResponse = await providerWithoutExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithoutExternalValidation.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -5528,7 +5491,7 @@ describe('OAuthProvider', () => {
       // Create a provider with external token resolution
       const providerWithExternalValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5538,7 +5501,6 @@ describe('OAuthProvider', () => {
           externalTokenCalls.push({
             token: input.token,
             requestUrl: input.request.url,
-            hasEnv: !!input.env,
           });
 
           // Simulate successful external token validation
@@ -5556,6 +5518,9 @@ describe('OAuthProvider', () => {
           // Return null for invalid tokens
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Try to access API with a valid external token
@@ -5563,7 +5528,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer external-valid-token',
       });
 
-      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const responseData = await apiResponse.json<any>();
@@ -5579,7 +5544,6 @@ describe('OAuthProvider', () => {
       expect(externalTokenCalls.length).toBe(1);
       expect(externalTokenCalls[0].token).toBe('external-valid-token');
       expect(externalTokenCalls[0].requestUrl).toBe('https://example.com/api/test');
-      expect(externalTokenCalls[0].hasEnv).toBe(true);
     });
 
     it('should reject external tokens when callback returns null', async () => {
@@ -5589,7 +5553,7 @@ describe('OAuthProvider', () => {
       // Create a provider with external token resolution that fails
       const providerWithFailingValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5600,6 +5564,9 @@ describe('OAuthProvider', () => {
           // Simulate failed validation by returning null
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Try to access API with an invalid external token
@@ -5607,7 +5574,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer invalid-external-token',
       });
 
-      const apiResponse = await providerWithFailingValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithFailingValidation.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(401);
       const error = await apiResponse.json<any>();
@@ -5626,7 +5593,7 @@ describe('OAuthProvider', () => {
       // Create a provider with external token resolution
       const providerWithExternalValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5638,6 +5605,9 @@ describe('OAuthProvider', () => {
             props: { source: 'external', shouldNeverSeeThis: true },
           };
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // First, create a valid internal token through normal OAuth flow
@@ -5654,7 +5624,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const registerResponse = await providerWithExternalValidation.fetch(registerRequest, mockEnv, mockCtx);
+      const registerResponse = await providerWithExternalValidation.fetch(registerRequest);
       const client = await registerResponse.json<any>();
       const clientId = client.client_id;
       const clientSecret = client.client_secret;
@@ -5667,7 +5637,7 @@ describe('OAuthProvider', () => {
           `&scope=read%20write&state=xyz123`
       );
 
-      const authResponse = await providerWithExternalValidation.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await providerWithExternalValidation.fetch(authRequest);
       const location = authResponse.headers.get('Location')!;
       const code = new URL(location).searchParams.get('code')!;
 
@@ -5686,7 +5656,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      const tokenResponse = await providerWithExternalValidation.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await providerWithExternalValidation.fetch(tokenRequest);
       const tokens = await tokenResponse.json<any>();
       const internalAccessToken = tokens.access_token;
 
@@ -5695,7 +5665,7 @@ describe('OAuthProvider', () => {
         Authorization: `Bearer ${internalAccessToken}`,
       });
 
-      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const responseData = await apiResponse.json<any>();
@@ -5714,7 +5684,7 @@ describe('OAuthProvider', () => {
 
       const providerWithExternalValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5734,6 +5704,9 @@ describe('OAuthProvider', () => {
 
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Use a token that mimics internal format but doesn't exist in KV
@@ -5741,7 +5714,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer user123:grant456:secret789',
       });
 
-      const apiResponse = await providerWithExternalValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithExternalValidation.fetch(apiRequest);
 
       expect(apiResponse.status).toBe(200);
       const responseData = await apiResponse.json<any>();
@@ -5760,7 +5733,7 @@ describe('OAuthProvider', () => {
 
       const providerWithExternalValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5791,6 +5764,9 @@ describe('OAuthProvider', () => {
 
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       // Test JWT-like token
@@ -5798,7 +5774,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.mock.token',
       });
 
-      const jwtResponse = await providerWithExternalValidation.fetch(jwtRequest, mockEnv, mockCtx);
+      const jwtResponse = await providerWithExternalValidation.fetch(jwtRequest);
       expect(jwtResponse.status).toBe(200);
       const jwtData = await jwtResponse.json<any>();
       expect(jwtData.user.tokenType).toBe('jwt');
@@ -5809,7 +5785,7 @@ describe('OAuthProvider', () => {
         Authorization: 'Bearer simple-bearer-token',
       });
 
-      const bearerResponse = await providerWithExternalValidation.fetch(bearerRequest, mockEnv, mockCtx);
+      const bearerResponse = await providerWithExternalValidation.fetch(bearerRequest);
       expect(bearerResponse.status).toBe(200);
       const bearerData = await bearerResponse.json<any>();
       expect(bearerData.user.tokenType).toBe('bearer');
@@ -5825,7 +5801,7 @@ describe('OAuthProvider', () => {
 
       const providerWithAsyncValidation = new OAuthProvider({
         apiRoute: ['/api/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5848,6 +5824,9 @@ describe('OAuthProvider', () => {
 
           return null;
         },
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
 
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
@@ -5855,7 +5834,7 @@ describe('OAuthProvider', () => {
       });
 
       const startTime = Date.now();
-      const apiResponse = await providerWithAsyncValidation.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await providerWithAsyncValidation.fetch(apiRequest);
       const endTime = Date.now();
 
       expect(apiResponse.status).toBe(200);
@@ -5890,9 +5869,7 @@ describe('OAuthProvider', () => {
             client_name: 'Test Client for Revocation',
             token_endpoint_auth_method: 'client_secret_basic',
           })
-        ),
-        mockEnv,
-        mockCtx
+        )
       );
 
       expect(clientResponse.status).toBe(201);
@@ -5906,7 +5883,7 @@ describe('OAuthProvider', () => {
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=read&state=test-state`
       );
-      const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      const authResponse = await oauthProvider.fetch(authRequest);
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code');
 
       const tokenRequest = createMockRequest(
@@ -5919,7 +5896,7 @@ describe('OAuthProvider', () => {
         `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(redirectUri)}`
       );
 
-      const tokenResponse = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      const tokenResponse = await oauthProvider.fetch(tokenRequest);
       expect(tokenResponse.status).toBe(200);
       const tokens = await tokenResponse.json<any>();
 
@@ -5934,7 +5911,7 @@ describe('OAuthProvider', () => {
         `token=${tokens.access_token}`
       );
 
-      const revokeResponse = await oauthProvider.fetch(revokeRequest, mockEnv, mockCtx);
+      const revokeResponse = await oauthProvider.fetch(revokeRequest);
       // Verify response doesn't contain unsupported_grant_type error
       const revokeResponseText = await revokeResponse.text();
       expect(revokeResponseText).not.toContain('unsupported_grant_type');
@@ -5943,7 +5920,7 @@ describe('OAuthProvider', () => {
       const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
         Authorization: `Bearer ${tokens.access_token}`,
       });
-      const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+      const apiResponse = await oauthProvider.fetch(apiRequest);
       expect(apiResponse.status).toBe(401); // Access token should no longer work
 
       // Step 4: Verify refresh token still works
@@ -5957,7 +5934,7 @@ describe('OAuthProvider', () => {
         `grant_type=refresh_token&refresh_token=${tokens.refresh_token}`
       );
 
-      const refreshResponse = await oauthProvider.fetch(refreshRequest, mockEnv, mockCtx);
+      const refreshResponse = await oauthProvider.fetch(refreshRequest);
       expect(refreshResponse.status).toBe(200); // Refresh token should still work
       const newTokens = await refreshResponse.json<any>();
       expect(newTokens.access_token).toBeDefined();
@@ -5967,22 +5944,14 @@ describe('OAuthProvider', () => {
 
   describe('Client ID Metadata Document (CIMD)', () => {
     let originalFetch: typeof globalThis.fetch;
-    let originalCloudflare: Cloudflare | undefined;
     let warnSpy: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
       originalFetch = globalThis.fetch;
-      originalCloudflare = (globalThis as { Cloudflare?: Cloudflare }).Cloudflare;
-      // Mock the Cloudflare global with the required compatibility flag for SSRF protection
-      (globalThis as any).Cloudflare = {
-        compatibilityFlags: {
-          global_fetch_strictly_public: true,
-        },
-      };
       // Enable CIMD for the CIMD test suite
       oauthProvider = new OAuthProvider({
         apiRoute: ['/api/', 'https://api.example.com/'],
-        apiHandler: TestApiHandler,
+        apiHandler: testApiHandler,
         defaultHandler: testDefaultHandler,
         authorizeEndpoint: '/authorize',
         tokenEndpoint: '/oauth/token',
@@ -5992,13 +5961,15 @@ describe('OAuthProvider', () => {
         allowImplicitFlow: true,
         allowTokenExchangeGrant: true,
         clientIdMetadataDocumentEnabled: true,
+        storage: memoryStore,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
       });
       warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     });
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
-      (globalThis as any).Cloudflare = originalCloudflare;
       warnSpy.mockRestore();
     });
 
@@ -6031,7 +6002,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        const authResponse = await oauthProvider.fetch(authRequest);
 
         expect(authResponse.status).toBe(302);
         expect(globalThis.fetch).toHaveBeenCalledWith(
@@ -6045,7 +6016,7 @@ describe('OAuthProvider', () => {
       it('should advertise CIMD support in metadata', async () => {
         const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
 
-        const metadataResponse = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+        const metadataResponse = await oauthProvider.fetch(metadataRequest);
         const metadata = await metadataResponse.json<any>();
 
         expect(metadata.client_id_metadata_document_supported).toBe(true);
@@ -6071,7 +6042,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat streaming response exceeding 5KB as invalid client', async () => {
@@ -6094,12 +6065,12 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
     });
 
     describe('HTTP Caching (Cloudflare)', () => {
-      it('should pass cacheEverything option to fetch for CIMD requests', async () => {
+      it('should fetch CIMD metadata with correct headers', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -6114,23 +6085,23 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        await oauthProvider.fetch(authRequest);
 
-        // Verify fetch was called with cacheEverything option
+        // Verify fetch was called with correct headers
         expect(globalThis.fetch).toHaveBeenCalledWith(
           cimdUrl,
           expect.objectContaining({
-            cf: { cacheEverything: true },
+            headers: expect.objectContaining({ Accept: 'application/json' }),
           })
         );
 
-        // No KV caching anymore
+        // No KV caching
         const cacheKey = `cimd:${cimdUrl}`;
-        const cached = await mockEnv.OAUTH_KV.get(cacheKey, { type: 'json' });
+        const cached = await memoryStore.get(cacheKey);
         expect(cached).toBeNull();
       });
 
-      it('should fetch CIMD metadata with cacheEverything even with Cache-Control headers', async () => {
+      it('should fetch CIMD metadata successfully even with Cache-Control headers in response', async () => {
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -6151,13 +6122,13 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        await oauthProvider.fetch(authRequest);
 
-        // Verify fetch was called with cacheEverything
+        // Verify fetch was called with correct headers
         expect(globalThis.fetch).toHaveBeenCalledWith(
           cimdUrl,
           expect.objectContaining({
-            cf: { cacheEverything: true },
+            headers: expect.objectContaining({ Accept: 'application/json' }),
           })
         );
       });
@@ -6170,11 +6141,11 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
-        const cached = await mockEnv.OAUTH_KV.get(cacheKey, { type: 'json' });
+        const cached = await memoryStore.get(cacheKey);
         expect(cached).toBeNull();
       });
 
@@ -6191,11 +6162,11 @@ describe('OAuthProvider', () => {
           `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
           'GET'
         );
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
 
         // No KV caching anymore - Cloudflare HTTP cache handles caching
         const cacheKey = `cimd:${cimdUrl}`;
-        const cached = await mockEnv.OAUTH_KV.get(cacheKey, { type: 'json' });
+        const cached = await memoryStore.get(cacheKey);
         expect(cached).toBeNull();
       });
     });
@@ -6216,7 +6187,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat client_secret_basic auth method as invalid client', async () => {
@@ -6234,7 +6205,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat client_secret_jwt auth method as invalid client', async () => {
@@ -6252,7 +6223,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should accept none auth method', async () => {
@@ -6271,7 +6242,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        const authResponse = await oauthProvider.fetch(authRequest);
 
         // Should succeed with redirect
         expect(authResponse.status).toBe(302);
@@ -6294,7 +6265,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        const authResponse = await oauthProvider.fetch(authRequest);
 
         // Should succeed with redirect
         expect(authResponse.status).toBe(302);
@@ -6316,7 +6287,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat missing redirect_uris as invalid client', async () => {
@@ -6333,7 +6304,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat empty redirect_uris as invalid client', async () => {
@@ -6351,7 +6322,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat invalid JSON response as invalid client', async () => {
@@ -6369,7 +6340,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
     });
 
@@ -6383,7 +6354,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
 
@@ -6396,7 +6367,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
 
@@ -6409,7 +6380,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
 
@@ -6422,7 +6393,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
         expect(globalThis.fetch).not.toHaveBeenCalled();
       });
     });
@@ -6437,7 +6408,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should pass AbortSignal to fetch', async () => {
@@ -6456,7 +6427,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        await oauthProvider.fetch(authRequest);
         expect(globalThis.fetch).toHaveBeenCalledWith(
           cimdUrl,
           expect.objectContaining({
@@ -6476,7 +6447,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat 500 responses as invalid client', async () => {
@@ -6488,7 +6459,7 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
 
       it('should treat network errors as invalid client', async () => {
@@ -6500,128 +6471,28 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(authRequest)).rejects.toThrow('Invalid client');
       });
     });
 
-    describe('SSRF Protection', () => {
-      it('should reject CIMD fetch when global_fetch_strictly_public is not enabled', async () => {
-        // Remove the compatibility flag to simulate it not being enabled
-        (globalThis as any).Cloudflare = {
-          compatibilityFlags: {
-            global_fetch_strictly_public: false,
-          },
-        };
-
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        const validMetadata = {
-          client_id: cimdUrl,
-          client_name: 'CIMD Test Client',
-          redirect_uris: ['https://client.example.com/callback'],
-          token_endpoint_auth_method: 'none',
-        };
-
-        // Fetch should not even be called
-        const fetchSpy = vi.fn().mockResolvedValue(
-          new Response(JSON.stringify(validMetadata), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          })
-        );
-        globalThis.fetch = fetchSpy;
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not set"
-        );
-        expect(fetchSpy).not.toHaveBeenCalled();
-      });
-
-      it('should reject CIMD fetch when Cloudflare global is undefined', async () => {
-        // Remove the Cloudflare global entirely
-        delete (globalThis as any).Cloudflare;
-
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-
-        const fetchSpy = vi.fn();
-        globalThis.fetch = fetchSpy;
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not set"
-        );
-        expect(fetchSpy).not.toHaveBeenCalled();
-      });
-
-      it('should reject CIMD fetch when compatibilityFlags is undefined', async () => {
-        // Cloudflare exists but without compatibilityFlags
-        (globalThis as any).Cloudflare = {};
-
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-
-        const fetchSpy = vi.fn();
-        globalThis.fetch = fetchSpy;
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "global_fetch_strictly_public' compatibility flag is not set"
-        );
-        expect(fetchSpy).not.toHaveBeenCalled();
-      });
-
-      it('should report client_id_metadata_document_supported as true when option and flag are enabled', async () => {
-        // Both clientIdMetadataDocumentEnabled and compat flag are enabled in beforeEach
+    describe('Metadata', () => {
+      it('should report client_id_metadata_document_supported as true when option is enabled', async () => {
         const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
-        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
+        const response = await oauthProvider.fetch(metadataRequest);
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
 
         expect(metadata.client_id_metadata_document_supported).toBe(true);
-      });
-
-      it('should report client_id_metadata_document_supported as false when compat flag is not enabled', async () => {
-        (globalThis as any).Cloudflare = {
-          compatibilityFlags: {
-            global_fetch_strictly_public: false,
-          },
-        };
-
-        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
-        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
-        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
-
-        expect(metadata.client_id_metadata_document_supported).toBe(false);
-      });
-
-      it('should report client_id_metadata_document_supported as false when Cloudflare global is undefined', async () => {
-        delete (globalThis as any).Cloudflare;
-
-        const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
-        const response = await oauthProvider.fetch(metadataRequest, mockEnv, mockCtx);
-        const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
-
-        expect(metadata.client_id_metadata_document_supported).toBe(false);
       });
     });
 
     describe('Explicit Opt-In', () => {
       it('should fall through to KV lookup for URL client_id when CIMD is not enabled', async () => {
         // Create provider WITHOUT clientIdMetadataDocumentEnabled
-        const providerWithoutCimd = new OAuthProvider({
+        let providerWithoutCimd!: OAuthProvider;
+        providerWithoutCimd = new OAuthProvider({
           apiRoute: ['/api/', 'https://api.example.com/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: testDefaultHandler,
+          apiHandler: testApiHandler,
+          defaultHandler: createTestDefaultHandler(() => providerWithoutCimd),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -6629,6 +6500,9 @@ describe('OAuthProvider', () => {
           accessTokenTTL: 3600,
           allowImplicitFlow: true,
           allowTokenExchangeGrant: true,
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
@@ -6641,14 +6515,14 @@ describe('OAuthProvider', () => {
         );
 
         // Should NOT call fetch — falls through to KV lookup (which returns null → "Invalid client")
-        await expect(providerWithoutCimd.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(providerWithoutCimd.fetch(authRequest)).rejects.toThrow('Invalid client');
         expect(fetchSpy).not.toHaveBeenCalled();
       });
 
       it('should report client_id_metadata_document_supported as false when option is not set', async () => {
         const providerWithoutCimd = new OAuthProvider({
           apiRoute: ['/api/', 'https://api.example.com/'],
-          apiHandler: TestApiHandler,
+          apiHandler: testApiHandler,
           defaultHandler: testDefaultHandler,
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
@@ -6657,18 +6531,20 @@ describe('OAuthProvider', () => {
           accessTokenTTL: 3600,
           allowImplicitFlow: true,
           allowTokenExchangeGrant: true,
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
         const metadataRequest = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'GET');
-        const response = await providerWithoutCimd.fetch(metadataRequest, mockEnv, mockCtx);
+        const response = await providerWithoutCimd.fetch(metadataRequest);
         const metadata = (await response.json()) as { client_id_metadata_document_supported: boolean };
 
         expect(metadata.client_id_metadata_document_supported).toBe(false);
       });
 
-      it('should fetch CIMD when option is enabled and compat flag is set', async () => {
+      it('should fetch CIMD when option is enabled', async () => {
         // oauthProvider already has clientIdMetadataDocumentEnabled: true from beforeEach
-        // and Cloudflare global_fetch_strictly_public: true
         const cimdUrl = 'https://client.example.com/oauth/metadata.json';
         const validMetadata = {
           client_id: cimdUrl,
@@ -6684,29 +6560,9 @@ describe('OAuthProvider', () => {
           'GET'
         );
 
-        const authResponse = await oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+        const authResponse = await oauthProvider.fetch(authRequest);
         expect(authResponse.status).toBe(302);
         expect(globalThis.fetch).toHaveBeenCalledWith(cimdUrl, expect.anything());
-      });
-
-      it('should throw when option is enabled but compat flag is missing', async () => {
-        // oauthProvider has clientIdMetadataDocumentEnabled: true from beforeEach
-        // but remove the compat flag
-        delete (globalThis as any).Cloudflare;
-
-        const cimdUrl = 'https://client.example.com/oauth/metadata.json';
-        const fetchSpy = vi.fn();
-        globalThis.fetch = fetchSpy;
-
-        const authRequest = createMockRequest(
-          `https://example.com/authorize?client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&response_type=code&state=test-state`,
-          'GET'
-        );
-
-        await expect(oauthProvider.fetch(authRequest, mockEnv, mockCtx)).rejects.toThrow(
-          "CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set."
-        );
-        expect(fetchSpy).not.toHaveBeenCalled();
       });
     });
 
@@ -6723,14 +6579,14 @@ describe('OAuthProvider', () => {
       it('should log warning with client URL and error message on HTTP failure', async () => {
         globalThis.fetch = vi.fn().mockResolvedValue(new Response('Not Found', { status: 404 }));
 
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(makeAuthRequest())).rejects.toThrow('Invalid client');
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.stringContaining('HTTP 404'));
       });
 
       it('should log warning on timeout', async () => {
         globalThis.fetch = vi.fn().mockRejectedValue(new DOMException('Aborted', 'AbortError'));
 
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(makeAuthRequest())).rejects.toThrow('Invalid client');
         expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(cimdUrl), expect.anything());
       });
 
@@ -6744,7 +6600,7 @@ describe('OAuthProvider', () => {
             )
           );
 
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(makeAuthRequest())).rejects.toThrow('Invalid client');
         expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('size limit'));
       });
 
@@ -6756,7 +6612,7 @@ describe('OAuthProvider', () => {
           })
         );
 
-        await expect(oauthProvider.fetch(makeAuthRequest(), mockEnv, mockCtx)).rejects.toThrow('Invalid client');
+        await expect(oauthProvider.fetch(makeAuthRequest())).rejects.toThrow('Invalid client');
         expect(warnSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('does not match'));
       });
     });
@@ -6773,7 +6629,7 @@ describe('OAuthProvider', () => {
           `grant_type=authorization_code&code=test-code&client_id=${encodeURIComponent(cimdUrl)}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
         );
 
-        const response = await oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+        const response = await oauthProvider.fetch(tokenRequest);
         expect(response.status).toBe(401);
         const body = await response.json<any>();
         expect(body.error).toBe('invalid_client');
@@ -6800,7 +6656,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -6813,7 +6669,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent(redirectUri)}` +
           `&scope=read&state=xyz123`
       );
-      return oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      return oauthProvider.fetch(authRequest);
     }
 
     // Helper to extract auth code from redirect response
@@ -6839,7 +6695,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      return oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      return oauthProvider.fetch(tokenRequest);
     }
 
     describe('should allow different ports for loopback redirect URIs', () => {
@@ -7009,9 +6865,7 @@ describe('OAuthProvider', () => {
       it('should reject completeAuthorization with tampered non-loopback redirect URI', async () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
 
-        // Get helpers
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         // Parse a valid auth request
         const authRequest = createMockRequest(
@@ -7038,9 +6892,7 @@ describe('OAuthProvider', () => {
       it('should accept completeAuthorization with valid loopback different port', async () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
 
-        // Get helpers
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         // Parse auth request with different port
         const authRequest = createMockRequest(
@@ -7066,8 +6918,7 @@ describe('OAuthProvider', () => {
       it('should accept completeAuthorization with valid localhost different port', async () => {
         await registerClient(['http://localhost:8080/callback']);
 
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?response_type=code&client_id=${clientId}` +
@@ -7116,7 +6967,7 @@ describe('OAuthProvider', () => {
         const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: `Bearer ${tokens.access_token}`,
         });
-        const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+        const apiResponse = await oauthProvider.fetch(apiRequest);
         expect(apiResponse.status).toBe(200);
       });
 
@@ -7182,17 +7033,12 @@ describe('OAuthProvider', () => {
    * the old grant with outdated props, creating an infinite re-auth loop.
    */
   describe('Re-authorization Grant Revocation (Issue #34)', () => {
-    let reAuthEnv: { OAUTH_KV: MockKV; OAUTH_PROVIDER: OAuthHelpers | null };
-    let reAuthCtx: MockExecutionContext;
+    let reAuthStore: MemoryStore;
     let propsFromAuthorize: Record<string, any>;
 
     // --- Helpers for the OAuth dance ---
 
-    async function registerClient(
-      provider: OAuthProvider<TestEnv>,
-      env: any,
-      ctx: MockExecutionContext
-    ): Promise<{ clientId: string; clientSecret: string }> {
+    async function registerClient(provider: OAuthProvider): Promise<{ clientId: string; clientSecret: string }> {
       const response = await provider.fetch(
         createMockRequest(
           'https://example.com/oauth/register',
@@ -7203,34 +7049,25 @@ describe('OAuthProvider', () => {
             client_name: 'MCP Test Client',
             token_endpoint_auth_method: 'client_secret_basic',
           })
-        ),
-        env,
-        ctx
+        )
       );
       const client = await response.json<any>();
       return { clientId: client.client_id, clientSecret: client.client_secret };
     }
 
-    async function authorizeAndGetCode(
-      provider: OAuthProvider<TestEnv>,
-      env: any,
-      ctx: MockExecutionContext,
-      clientId: string
-    ): Promise<string> {
+    async function authorizeAndGetCode(provider: OAuthProvider, clientId: string): Promise<string> {
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${clientId}` +
           `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
           `&scope=${encodeURIComponent('read write')}&state=test-state`
       );
-      const response = await provider.fetch(authRequest, env, ctx);
+      const response = await provider.fetch(authRequest);
       const location = response.headers.get('Location')!;
       return new URL(location).searchParams.get('code')!;
     }
 
     async function exchangeCodeForTokens(
-      provider: OAuthProvider<TestEnv>,
-      env: any,
-      ctx: MockExecutionContext,
+      provider: OAuthProvider,
       code: string,
       clientId: string,
       clientSecret: string
@@ -7244,17 +7081,13 @@ describe('OAuthProvider', () => {
             Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
           },
           `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}`
-        ),
-        env,
-        ctx
+        )
       );
       return response.json<any>();
     }
 
     async function refreshTokens(
-      provider: OAuthProvider<TestEnv>,
-      env: any,
-      ctx: MockExecutionContext,
+      provider: OAuthProvider,
       refreshToken: string,
       clientId: string,
       clientSecret: string
@@ -7269,9 +7102,7 @@ describe('OAuthProvider', () => {
               Authorization: `Basic ${btoa(`${clientId}:${clientSecret}`)}`,
             },
             `grant_type=refresh_token&refresh_token=${refreshToken}`
-          ),
-          env,
-          ctx
+          )
         );
         return { status: response.status, body: await response.json<any>() };
       } catch (err: any) {
@@ -7279,29 +7110,23 @@ describe('OAuthProvider', () => {
       }
     }
 
-    async function callApi(
-      provider: OAuthProvider<TestEnv>,
-      env: any,
-      ctx: MockExecutionContext,
-      accessToken: string
-    ): Promise<{ status: number; body: any }> {
+    async function callApi(provider: OAuthProvider, accessToken: string): Promise<{ status: number; body: any }> {
       const response = await provider.fetch(
         createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: `Bearer ${accessToken}`,
-        }),
-        env,
-        ctx
+        })
       );
       return { status: response.status, body: await response.json<any>() };
     }
 
-    function createDefaultHandlerNoRevoke(getProps: () => Record<string, any>) {
+    function createDefaultHandlerNoRevoke(getProps: () => Record<string, any>, getProvider: () => OAuthProvider) {
       return {
-        async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+        async fetch(request: Request) {
           const url = new URL(request.url);
           if (url.pathname === '/authorize') {
-            const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-            const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+            const provider = getProvider();
+            const oauthReqInfo = await provider.parseAuthRequest(request);
+            const { redirectTo } = await provider.completeAuthorization({
               request: oauthReqInfo,
               userId: 'user-1',
               metadata: {},
@@ -7316,13 +7141,14 @@ describe('OAuthProvider', () => {
       };
     }
 
-    function createDefaultHandlerWithRevoke(getProps: () => Record<string, any>) {
+    function createDefaultHandlerWithRevoke(getProps: () => Record<string, any>, getProvider: () => OAuthProvider) {
       return {
-        async fetch(request: Request, env: any, _ctx: ExecutionContext) {
+        async fetch(request: Request) {
           const url = new URL(request.url);
           if (url.pathname === '/authorize') {
-            const oauthReqInfo = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-            const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+            const provider = getProvider();
+            const oauthReqInfo = await provider.parseAuthRequest(request);
+            const { redirectTo } = await provider.completeAuthorization({
               request: oauthReqInfo,
               userId: 'user-1',
               metadata: {},
@@ -7338,35 +7164,36 @@ describe('OAuthProvider', () => {
 
     beforeEach(() => {
       vi.resetAllMocks();
-      reAuthEnv = { OAUTH_KV: new MockKV(), OAUTH_PROVIDER: null };
-      reAuthCtx = new MockExecutionContext();
+      reAuthStore = new MemoryStore();
       propsFromAuthorize = { upstreamToken: 'token-v1', version: 1 };
-    });
-
-    afterEach(() => {
-      reAuthEnv.OAUTH_KV.clear();
     });
 
     describe('WITHOUT revokeExistingGrants (opt-out / the bug)', () => {
       it('should demonstrate that re-authorization creates a second grant while old grant persists', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          apiHandler: testApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
+          storage: reAuthStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
-        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const { clientId, clientSecret } = await registerClient(provider);
 
         // --- First authorization: props v1 ---
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+        const code1 = await authorizeAndGetCode(provider, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Verify props v1 are served
-        const api1 = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        const api1 = await callApi(provider, tokens1.access_token);
         expect(api1.status).toBe(200);
         expect(api1.body.user.upstreamToken).toBe('token-v1');
 
@@ -7374,32 +7201,25 @@ describe('OAuthProvider', () => {
         propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
 
         // --- Second authorization (re-auth): props v2 ---
-        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+        const code2 = await authorizeAndGetCode(provider, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, code2, clientId, clientSecret);
 
         // New tokens have correct props v2
-        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        const api2 = await callApi(provider, tokens2.access_token);
         expect(api2.status).toBe(200);
         expect(api2.body.user.upstreamToken).toBe('token-v2');
 
         // BUG: Old tokens STILL WORK with stale props v1!
-        const apiOld = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        const apiOld = await callApi(provider, tokens1.access_token);
         expect(apiOld.status).toBe(200);
         expect(apiOld.body.user.upstreamToken).toBe('token-v1'); // stale!
 
         // BUG: Old refresh token STILL WORKS - client can keep getting stale v1 tokens
-        const refreshOld = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(200); // This is the root cause of infinite loops
 
         // Verify there are now TWO grants for the same user+client
-        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        const grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(2);
         expect(grants.items.every((g: any) => g.clientId === clientId)).toBe(true);
       });
@@ -7407,8 +7227,11 @@ describe('OAuthProvider', () => {
       it('should demonstrate the infinite re-auth loop scenario', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize),
+          apiHandler: testApiHandler,
+          defaultHandler: createDefaultHandlerNoRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7426,34 +7249,30 @@ describe('OAuthProvider', () => {
             }
             return undefined;
           },
+          storage: reAuthStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
-        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const { clientId, clientSecret } = await registerClient(provider);
 
         // First auth with a token that will expire
         propsFromAuthorize = { upstreamToken: 'token-v1-expired', version: 1 };
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+        const code1 = await authorizeAndGetCode(provider, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Simulate upstream token expiry - refresh should fail with invalid_grant
-        const refresh1 = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refresh1 = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refresh1.status).toBe(400);
         expect(refresh1.error).toContain('invalid_grant');
 
         // Client goes through re-auth with fresh props
         propsFromAuthorize = { upstreamToken: 'token-v2-fresh', version: 2 };
-        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+        const code2 = await authorizeAndGetCode(provider, clientId);
+        await exchangeCodeForTokens(provider, code2, clientId, clientSecret);
 
         // THE BUG: Old grant still exists — two grants for the same user+client
-        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        const grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(2);
       });
     });
@@ -7462,22 +7281,28 @@ describe('OAuthProvider', () => {
       it('should revoke old grants on re-authorization so stale tokens are invalidated', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          apiHandler: testApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
-        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const { clientId, clientSecret } = await registerClient(provider);
 
         // --- First authorization: props v1 ---
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+        const code1 = await authorizeAndGetCode(provider, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Verify first auth works
-        const api1 = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        const api1 = await callApi(provider, tokens1.access_token);
         expect(api1.status).toBe(200);
         expect(api1.body.user.upstreamToken).toBe('token-v1');
 
@@ -7485,31 +7310,24 @@ describe('OAuthProvider', () => {
         propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
 
         // --- Re-authorize with revokeExistingGrants: true ---
-        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+        const code2 = await authorizeAndGetCode(provider, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, code2, clientId, clientSecret);
 
         // New tokens have correct props v2
-        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        const api2 = await callApi(provider, tokens2.access_token);
         expect(api2.status).toBe(200);
         expect(api2.body.user.upstreamToken).toBe('token-v2');
 
         // FIX: Old access token should now be INVALID (grant was revoked)
-        const apiOld = await callApi(provider, reAuthEnv, reAuthCtx, tokens1.access_token);
+        const apiOld = await callApi(provider, tokens1.access_token);
         expect(apiOld.status).toBe(401);
 
         // FIX: Old refresh token should also be INVALID
-        const refreshOld = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(400);
 
         // FIX: Only ONE grant should exist for this user+client
-        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        const grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(1);
         expect(grants.items[0].clientId).toBe(clientId);
       });
@@ -7517,8 +7335,11 @@ describe('OAuthProvider', () => {
       it('should break the infinite re-auth loop', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          apiHandler: testApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7536,72 +7357,60 @@ describe('OAuthProvider', () => {
             }
             return undefined;
           },
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
-        const { clientId, clientSecret } = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const { clientId, clientSecret } = await registerClient(provider);
 
         // First auth with token that will expire
         propsFromAuthorize = { upstreamToken: 'token-v1-expired', version: 1 };
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens1 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, clientId, clientSecret);
+        const code1 = await authorizeAndGetCode(provider, clientId);
+        const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Refresh fails because upstream token is expired
-        const refresh1 = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refresh1 = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refresh1.status).toBe(400);
         expect(refresh1.error).toContain('invalid_grant');
 
         // Re-authorize with fresh props + revokeExistingGrants
         propsFromAuthorize = { upstreamToken: 'token-v2-fresh', version: 2 };
-        const code2 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, clientId);
-        const tokens2 = await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code2, clientId, clientSecret);
+        const code2 = await authorizeAndGetCode(provider, clientId);
+        const tokens2 = await exchangeCodeForTokens(provider, code2, clientId, clientSecret);
 
         // FIX: Old refresh token FAILS immediately (grant was revoked)
-        const refreshOld = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(400);
 
         // New refresh token works correctly with fresh props
-        const refreshNew = await refreshTokens(
-          provider,
-          reAuthEnv,
-          reAuthCtx,
-          tokens2.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshNew = await refreshTokens(provider, tokens2.refresh_token, clientId, clientSecret);
         expect(refreshNew.status).toBe(200);
 
         // Only one grant should exist
-        const grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        const grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(1);
       });
 
       it('should not affect grants from other clients', async () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
-          apiHandler: TestApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize),
+          apiHandler: testApiHandler,
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
           scopesSupported: ['read', 'write'],
+          storage: memoryStore,
+          allowPlainPKCE: true,
+          refreshTokenTTL: 86400,
         });
 
         // Register two different clients
-        const client1 = await registerClient(provider, reAuthEnv, reAuthCtx);
+        const client1 = await registerClient(provider);
 
         const response2 = await provider.fetch(
           createMockRequest(
@@ -7613,16 +7422,14 @@ describe('OAuthProvider', () => {
               client_name: 'Other MCP Client',
               token_endpoint_auth_method: 'client_secret_basic',
             })
-          ),
-          reAuthEnv,
-          reAuthCtx
+          )
         );
         const c2 = await response2.json<any>();
         const client2 = { clientId: c2.client_id, clientSecret: c2.client_secret };
 
         // Authorize both clients
-        const code1 = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, client1.clientId);
-        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1, client1.clientId, client1.clientSecret);
+        const code1 = await authorizeAndGetCode(provider, client1.clientId);
+        await exchangeCodeForTokens(provider, code1, client1.clientId, client1.clientSecret);
 
         // For client2, we need to use its redirect_uri
         const authRequest2 = createMockRequest(
@@ -7630,7 +7437,7 @@ describe('OAuthProvider', () => {
             `&redirect_uri=${encodeURIComponent('https://other-client.example.com/callback')}` +
             `&scope=read%20write&state=test-state`
         );
-        const authResponse2 = await provider.fetch(authRequest2, reAuthEnv, reAuthCtx);
+        const authResponse2 = await provider.fetch(authRequest2);
         const code2 = new URL(authResponse2.headers.get('Location')!).searchParams.get('code')!;
 
         const tokenResponse2 = await provider.fetch(
@@ -7642,27 +7449,25 @@ describe('OAuthProvider', () => {
               Authorization: `Basic ${btoa(`${client2.clientId}:${client2.clientSecret}`)}`,
             },
             `grant_type=authorization_code&code=${code2}&redirect_uri=${encodeURIComponent('https://other-client.example.com/callback')}`
-          ),
-          reAuthEnv,
-          reAuthCtx
+          )
         );
         const tokens2 = await tokenResponse2.json<any>();
 
         // Should have 2 grants (one per client)
-        let grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        let grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(2);
 
         // Re-authorize client1 with revokeExistingGrants
         propsFromAuthorize = { upstreamToken: 'token-v2', version: 2 };
-        const code1b = await authorizeAndGetCode(provider, reAuthEnv, reAuthCtx, client1.clientId);
-        await exchangeCodeForTokens(provider, reAuthEnv, reAuthCtx, code1b, client1.clientId, client1.clientSecret);
+        const code1b = await authorizeAndGetCode(provider, client1.clientId);
+        await exchangeCodeForTokens(provider, code1b, client1.clientId, client1.clientSecret);
 
         // Should still have 2 grants: new client1 grant + untouched client2 grant
-        grants = await reAuthEnv.OAUTH_PROVIDER!.listUserGrants('user-1');
+        grants = await provider.listUserGrants('user-1');
         expect(grants.items.length).toBe(2);
 
         // Client2's tokens should still work
-        const api2 = await callApi(provider, reAuthEnv, reAuthCtx, tokens2.access_token);
+        const api2 = await callApi(provider, tokens2.access_token);
         expect(api2.status).toBe(200);
       });
     });
@@ -7687,7 +7492,7 @@ describe('OAuthProvider', () => {
         JSON.stringify(clientData)
       );
 
-      const response = await oauthProvider.fetch(request, mockEnv, mockCtx);
+      const response = await oauthProvider.fetch(request);
       const client = await response.json<any>();
       clientId = client.client_id;
       clientSecret = client.client_secret;
@@ -7700,7 +7505,7 @@ describe('OAuthProvider', () => {
           `&redirect_uri=${encodeURIComponent(redirectUri)}` +
           `&scope=read&state=xyz123`
       );
-      return oauthProvider.fetch(authRequest, mockEnv, mockCtx);
+      return oauthProvider.fetch(authRequest);
     }
 
     // Helper to extract auth code from redirect response
@@ -7726,7 +7531,7 @@ describe('OAuthProvider', () => {
         params.toString()
       );
 
-      return oauthProvider.fetch(tokenRequest, mockEnv, mockCtx);
+      return oauthProvider.fetch(tokenRequest);
     }
 
     describe('should allow different ports for loopback redirect URIs', () => {
@@ -7896,9 +7701,7 @@ describe('OAuthProvider', () => {
       it('should reject completeAuthorization with tampered non-loopback redirect URI', async () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
 
-        // Get helpers
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         // Parse a valid auth request
         const authRequest = createMockRequest(
@@ -7925,9 +7728,7 @@ describe('OAuthProvider', () => {
       it('should accept completeAuthorization with valid loopback different port', async () => {
         await registerClient(['http://127.0.0.1:8080/callback']);
 
-        // Get helpers
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         // Parse auth request with different port
         const authRequest = createMockRequest(
@@ -7953,8 +7754,7 @@ describe('OAuthProvider', () => {
       it('should accept completeAuthorization with valid localhost different port', async () => {
         await registerClient(['http://localhost:8080/callback']);
 
-        await oauthProvider.fetch(createMockRequest('https://example.com/'), mockEnv, mockCtx);
-        const helpers = mockEnv.OAUTH_PROVIDER!;
+        const helpers = oauthProvider;
 
         const authRequest = createMockRequest(
           `https://example.com/authorize?response_type=code&client_id=${clientId}` +
@@ -8003,7 +7803,7 @@ describe('OAuthProvider', () => {
         const apiRequest = createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: `Bearer ${tokens.access_token}`,
         });
-        const apiResponse = await oauthProvider.fetch(apiRequest, mockEnv, mockCtx);
+        const apiResponse = await oauthProvider.fetch(apiRequest);
         expect(apiResponse.status).toBe(200);
       });
 
@@ -8058,6 +7858,557 @@ describe('OAuthProvider', () => {
         // Different path, should not match any registered URI
         await expect(makeAuthRequest('http://127.0.0.1:55555/callback')).rejects.toThrow('Invalid redirect URI');
       });
+    });
+  });
+
+  describe('Refresh Token Grace Period', () => {
+    async function setupWithGracePeriod(opts: {
+      refreshTokenGracePeriod?: number;
+      revokeGrantOnRefreshTokenReplay?: boolean;
+    }) {
+      const store = new MemoryStore();
+      let provider: OAuthProvider;
+      provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => provider),
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
+        storage: store,
+        ...opts,
+      });
+
+      // Register client
+      const registerResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        )
+      );
+      const client = await registerResponse.json<any>();
+
+      // Authorize
+      const authResponse = await provider.fetch(
+        createMockRequest(
+          `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
+            `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz`
+        )
+      );
+      const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+      // Exchange code for tokens
+      const tokenParams = new URLSearchParams();
+      tokenParams.append('grant_type', 'authorization_code');
+      tokenParams.append('code', code);
+      tokenParams.append('redirect_uri', 'https://client.example.com/callback');
+      tokenParams.append('client_id', client.client_id);
+      tokenParams.append('client_secret', client.client_secret);
+
+      const tokenResponse = await provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          tokenParams.toString()
+        )
+      );
+      const tokens = await tokenResponse.json<any>();
+
+      return { provider, store, client, tokens };
+    }
+
+    function makeRefreshRequest(provider: OAuthProvider, refreshToken: string, clientId: string, clientSecret: string) {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'refresh_token');
+      params.append('refresh_token', refreshToken);
+      params.append('client_id', clientId);
+      params.append('client_secret', clientSecret);
+      return provider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
+      );
+    }
+
+    it('should accept previous refresh token within grace period', async () => {
+      const { provider, client, tokens } = await setupWithGracePeriod({ refreshTokenGracePeriod: 60 });
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate once
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res1.status).toBe(200);
+      const newTokens = await res1.json<any>();
+      expect(newTokens.refresh_token).not.toBe(originalRefreshToken);
+
+      // Use the previous token again (within grace period)
+      const res2 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res2.status).toBe(200);
+    });
+
+    it('should reject previous refresh token after grace period expires', async () => {
+      const { provider, client, tokens } = await setupWithGracePeriod({ refreshTokenGracePeriod: 1 });
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate once
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res1.status).toBe(200);
+
+      // Wait for grace period to expire
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+
+      // Previous token should now be rejected
+      const res2 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res2.status).toBe(400);
+      const error = await res2.json<any>();
+      expect(error.error).toBe('invalid_grant');
+      expect(error.error_description).toBe('Previous refresh token has expired');
+    });
+
+    it('should keep unlimited grace period when option is undefined', async () => {
+      const { provider, client, tokens } = await setupWithGracePeriod({});
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate once
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res1.status).toBe(200);
+
+      // Previous token should still work (no grace period limit)
+      const res2 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res2.status).toBe(200);
+    });
+
+    it('should immediately reject previous token with grace period of 0', async () => {
+      const { provider, client, tokens } = await setupWithGracePeriod({ refreshTokenGracePeriod: 0 });
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate once
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res1.status).toBe(200);
+
+      // Previous token should be immediately rejected
+      const res2 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res2.status).toBe(400);
+      const error = await res2.json<any>();
+      expect(error.error).toBe('invalid_grant');
+    });
+
+    it('should revoke grant on replay when revokeGrantOnRefreshTokenReplay is true', async () => {
+      const { provider, store, client, tokens } = await setupWithGracePeriod({
+        revokeGrantOnRefreshTokenReplay: true,
+      });
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate twice so originalRefreshToken is neither current nor previous
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res1.status).toBe(200);
+      const newTokens1 = await res1.json<any>();
+
+      const res2 = await makeRefreshRequest(provider, newTokens1.refresh_token, client.client_id, client.client_secret);
+      expect(res2.status).toBe(200);
+
+      // Now originalRefreshToken is fully superseded — replay attempt
+      const res3 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res3.status).toBe(400);
+
+      // Grant should be revoked
+      const grants = await store.list({ prefix: 'grant:' });
+      expect(grants.keys.length).toBe(0);
+    });
+
+    it('should not revoke grant on replay by default', async () => {
+      const { provider, store, client, tokens } = await setupWithGracePeriod({});
+      const originalRefreshToken = tokens.refresh_token;
+
+      // Rotate twice
+      const res1 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      const newTokens1 = await res1.json<any>();
+      await makeRefreshRequest(provider, newTokens1.refresh_token, client.client_id, client.client_secret);
+
+      // Replay with fully superseded token
+      const res3 = await makeRefreshRequest(provider, originalRefreshToken, client.client_id, client.client_secret);
+      expect(res3.status).toBe(400);
+
+      // Grant should still exist
+      const grants = await store.list({ prefix: 'grant:' });
+      expect(grants.keys.length).toBe(1);
+    });
+
+    it('should store previousRefreshTokenRotatedAt in grant after rotation', async () => {
+      const { provider, store, client, tokens } = await setupWithGracePeriod({ refreshTokenGracePeriod: 60 });
+
+      const beforeRotation = Math.floor(Date.now() / 1000);
+      await makeRefreshRequest(provider, tokens.refresh_token, client.client_id, client.client_secret);
+      const afterRotation = Math.floor(Date.now() / 1000);
+
+      const grants = await store.list({ prefix: 'grant:' });
+      const grant = JSON.parse((await store.get(grants.keys[0].name))!);
+      expect(grant.previousRefreshTokenRotatedAt).toBeGreaterThanOrEqual(beforeRotation);
+      expect(grant.previousRefreshTokenRotatedAt).toBeLessThanOrEqual(afterRotation);
+    });
+  });
+
+  describe('CIMD Caching', () => {
+    const cimdClientId = 'https://client.example.com/.well-known/oauth-client';
+    const cimdDocument = {
+      client_id: cimdClientId,
+      redirect_uris: ['https://client.example.com/callback'],
+      client_name: 'CIMD Test Client',
+      token_endpoint_auth_method: 'none',
+    };
+
+    function setupCimdProvider(cimdCacheTtl: number, fetchMock: typeof globalThis.fetch) {
+      const store = new MemoryStore();
+      vi.stubGlobal('fetch', fetchMock);
+
+      let provider: OAuthProvider;
+      provider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: testApiHandler,
+        defaultHandler: createTestDefaultHandler(() => provider),
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
+        storage: store,
+        clientIdMetadataDocumentEnabled: true,
+        cimdCacheTtl,
+      });
+
+      return { provider, store };
+    }
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('should cache CIMD responses when cimdCacheTtl is set', async () => {
+      const fetchMock = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
+      );
+
+      const { provider } = setupCimdProvider(300, fetchMock);
+
+      // First lookup triggers fetch
+      const client1 = await provider.lookupClient(cimdClientId);
+      expect(client1).not.toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Second lookup should use cache
+      const client2 = await provider.lookupClient(cimdClientId);
+      expect(client2).not.toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1); // Still 1
+    });
+
+    it('should re-fetch after cache expires', async () => {
+      const fetchMock = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
+      );
+
+      const { provider } = setupCimdProvider(1, fetchMock);
+
+      // First fetch
+      await provider.lookupClient(cimdClientId);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // Wait for cache to expire
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+
+      // Should re-fetch
+      await provider.lookupClient(cimdClientId);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not cache when cimdCacheTtl is 0', async () => {
+      const fetchMock = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
+      );
+
+      const { provider } = setupCimdProvider(0, fetchMock);
+
+      await provider.lookupClient(cimdClientId);
+      await provider.lookupClient(cimdClientId);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('should serve stale cache on fetch failure', async () => {
+      let callCount = 0;
+      const fetchMock = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response(JSON.stringify(cimdDocument), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          );
+        }
+        return Promise.reject(new Error('Network error'));
+      });
+
+      const { provider } = setupCimdProvider(1, fetchMock);
+
+      // First fetch succeeds and caches
+      const client1 = await provider.lookupClient(cimdClientId);
+      expect(client1).not.toBeNull();
+
+      // Wait for cache to expire
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+
+      // Second fetch fails, should serve stale cache
+      const client2 = await provider.lookupClient(cimdClientId);
+      expect(client2).not.toBeNull();
+      expect(client2!.clientId).toBe(cimdClientId);
+    });
+
+    it('should return null on fetch failure without cache', async () => {
+      const fetchMock = vi.fn().mockRejectedValue(new Error('Network error'));
+      const { provider } = setupCimdProvider(300, fetchMock);
+
+      const client = await provider.lookupClient(cimdClientId);
+      expect(client).toBeNull();
+    });
+  });
+
+  describe('Token Exchange actor_token (RFC 8693)', () => {
+    let exchangeProvider: OAuthProvider;
+    let exchangeStore: MemoryStore;
+    let subjectAccessToken: string;
+    let actorAccessToken: string;
+    let exchangeClientId: string;
+    let exchangeClientSecret: string;
+    let callbackOptions: any;
+
+    beforeEach(async () => {
+      exchangeStore = new MemoryStore();
+      callbackOptions = null;
+
+      exchangeProvider = new OAuthProvider({
+        apiRoute: '/api/',
+        apiHandler: testApiHandler,
+        defaultHandler: {
+          async fetch(request: Request) {
+            const url = new URL(request.url);
+            if (url.pathname === '/authorize') {
+              const oauthReqInfo = await exchangeProvider.parseAuthRequest(request);
+              const userId = url.searchParams.get('user') || 'subject-user';
+              const { redirectTo } = await exchangeProvider.completeAuthorization({
+                request: oauthReqInfo,
+                userId,
+                metadata: {},
+                scope: oauthReqInfo.scope,
+                props: { userId, role: 'user' },
+              });
+              return Response.redirect(redirectTo, 302);
+            }
+            return new Response('OK', { status: 200 });
+          },
+        },
+        authorizeEndpoint: '/authorize',
+        tokenEndpoint: '/oauth/token',
+        clientRegistrationEndpoint: '/oauth/register',
+        scopesSupported: ['read', 'write'],
+        accessTokenTTL: 3600,
+        allowPlainPKCE: true,
+        refreshTokenTTL: 86400,
+        allowTokenExchangeGrant: true,
+        storage: exchangeStore,
+        tokenExchangeCallback: (opts) => {
+          callbackOptions = opts;
+          return undefined;
+        },
+      });
+
+      // Register client
+      const registerResponse = await exchangeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Exchange Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        )
+      );
+      const client = await registerResponse.json<any>();
+      exchangeClientId = client.client_id;
+      exchangeClientSecret = client.client_secret;
+
+      // Get subject user access token
+      async function getAccessToken(user: string): Promise<string> {
+        const authResponse = await exchangeProvider.fetch(
+          createMockRequest(
+            `https://example.com/authorize?response_type=code&client_id=${exchangeClientId}` +
+              `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz&user=${user}`
+          )
+        );
+        const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+        const tokenParams = new URLSearchParams();
+        tokenParams.append('grant_type', 'authorization_code');
+        tokenParams.append('code', code);
+        tokenParams.append('redirect_uri', 'https://client.example.com/callback');
+        tokenParams.append('client_id', exchangeClientId);
+        tokenParams.append('client_secret', exchangeClientSecret);
+
+        const tokenResponse = await exchangeProvider.fetch(
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            { 'Content-Type': 'application/x-www-form-urlencoded' },
+            tokenParams.toString()
+          )
+        );
+        const tokens = await tokenResponse.json<any>();
+        return tokens.access_token;
+      }
+
+      subjectAccessToken = await getAccessToken('subject-user');
+      actorAccessToken = await getAccessToken('actor-user');
+    });
+
+    it('should pass actor_token and actor_token_type to callback', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', subjectAccessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('actor_token', actorAccessToken);
+      params.append('actor_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('client_id', exchangeClientId);
+      params.append('client_secret', exchangeClientSecret);
+
+      const response = await exchangeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
+      );
+      expect(response.status).toBe(200);
+
+      expect(callbackOptions).not.toBeNull();
+      expect(callbackOptions.actorToken).toBe(actorAccessToken);
+      expect(callbackOptions.actorTokenType).toBe('urn:ietf:params:oauth:token-type:access_token');
+      expect(callbackOptions.actorTokenInfo).toBeDefined();
+      expect(callbackOptions.actorTokenInfo.userId).toBe('actor-user');
+    });
+
+    it('should reject when actor_token is present without actor_token_type', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', subjectAccessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('actor_token', actorAccessToken);
+      params.append('client_id', exchangeClientId);
+      params.append('client_secret', exchangeClientSecret);
+
+      const response = await exchangeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
+      );
+      expect(response.status).toBe(400);
+
+      const error = await response.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toContain('actor_token_type is required');
+    });
+
+    it('should work without actor_token (backward compatible)', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', subjectAccessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('client_id', exchangeClientId);
+      params.append('client_secret', exchangeClientSecret);
+
+      const response = await exchangeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
+      );
+      expect(response.status).toBe(200);
+
+      expect(callbackOptions).not.toBeNull();
+      expect(callbackOptions.actorToken).toBeUndefined();
+      expect(callbackOptions.actorTokenInfo).toBeUndefined();
+    });
+
+    it('should pass actor_token through programmatic exchangeToken API', async () => {
+      const response = await exchangeProvider.exchangeToken({
+        subjectToken: subjectAccessToken,
+        actorToken: actorAccessToken,
+        actorTokenType: 'urn:ietf:params:oauth:token-type:access_token',
+      });
+
+      expect(response.access_token).toBeDefined();
+      expect(callbackOptions).not.toBeNull();
+      expect(callbackOptions.actorToken).toBe(actorAccessToken);
+      expect(callbackOptions.actorTokenInfo).toBeDefined();
+    });
+
+    it('should reject unsupported actor_token_type', async () => {
+      const params = new URLSearchParams();
+      params.append('grant_type', 'urn:ietf:params:oauth:grant-type:token-exchange');
+      params.append('subject_token', subjectAccessToken);
+      params.append('subject_token_type', 'urn:ietf:params:oauth:token-type:access_token');
+      params.append('actor_token', 'some-external-token');
+      params.append('actor_token_type', 'urn:ietf:params:oauth:token-type:id_token');
+      params.append('client_id', exchangeClientId);
+      params.append('client_secret', exchangeClientSecret);
+
+      const response = await exchangeProvider.fetch(
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
+      );
+      expect(response.status).toBe(400);
+
+      const error = await response.json<any>();
+      expect(error.error).toBe('invalid_request');
+      expect(error.error_description).toContain('Only access_token actor_token_type');
     });
   });
 });

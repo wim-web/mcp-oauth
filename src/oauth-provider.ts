@@ -1,25 +1,111 @@
-import { WorkerEntrypoint } from 'cloudflare:workers';
+// Storage Adapter
 
-// Log CIMD status on module load
-const hasStrictlyPublicFetch =
-  typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags?.global_fetch_strictly_public === true;
+/**
+ * Abstract storage interface replacing Cloudflare KV.
+ * Implementations must support prefix-based listing and TTL-based expiration.
+ */
+export interface StorageAdapter {
+  /**
+   * Get a value by key. Returns null if not found or expired.
+   */
+  get(key: string): Promise<string | null>;
 
-if (!hasStrictlyPublicFetch) {
-  console.warn(
-    `CIMD (Client ID Metadata Document) is disabled: add '"compatibility_flags": ["global_fetch_strictly_public"]' to your wrangler.jsonc to enable. ` +
-      `See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public`
-  );
+  /**
+   * Store a value with optional TTL-based expiration.
+   * @param key - The storage key
+   * @param value - The string value to store
+   * @param options - Optional expiration settings
+   */
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+
+  /**
+   * Delete a key.
+   */
+  delete(key: string): Promise<void>;
+
+  /**
+   * List keys matching a prefix with cursor-based pagination.
+   */
+  list(options: { prefix: string; limit?: number; cursor?: string }): Promise<{
+    keys: { name: string }[];
+    list_complete: boolean;
+    cursor?: string;
+  }>;
+}
+
+/**
+ * In-memory StorageAdapter for development and testing.
+ * Not suitable for production use.
+ */
+export class MemoryStore implements StorageAdapter {
+  private data = new Map<string, { value: string; expiration?: number }>();
+
+  async get(key: string): Promise<string | null> {
+    const entry = this.data.get(key);
+    if (!entry) return null;
+    if (entry.expiration && entry.expiration <= Date.now()) {
+      this.data.delete(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  async put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void> {
+    const expiration = options?.expirationTtl ? Date.now() + options.expirationTtl * 1000 : undefined;
+    this.data.set(key, { value, expiration });
+  }
+
+  async delete(key: string): Promise<void> {
+    this.data.delete(key);
+  }
+
+  async list(options: {
+    prefix: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<{ keys: { name: string }[]; list_complete: boolean; cursor?: string }> {
+    const now = Date.now();
+    const allKeys = Array.from(this.data.keys())
+      .filter((key) => {
+        if (!key.startsWith(options.prefix)) return false;
+        const entry = this.data.get(key)!;
+        if (entry.expiration && entry.expiration <= now) {
+          this.data.delete(key);
+          return false;
+        }
+        return true;
+      })
+      .sort();
+
+    const limit = options.limit ?? 1000;
+    let startIndex = 0;
+
+    if (options.cursor) {
+      const cursorIndex = allKeys.indexOf(options.cursor);
+      if (cursorIndex !== -1) {
+        startIndex = cursorIndex + 1;
+      }
+    }
+
+    const keys = allKeys.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + limit < allKeys.length;
+
+    return {
+      keys: keys.map((name) => ({ name })),
+      list_complete: !hasMore,
+      cursor: hasMore ? keys[keys.length - 1] : undefined,
+    };
+  }
+
+  /**
+   * Clear all data. Useful for test cleanup.
+   */
+  clear(): void {
+    this.data.clear();
+  }
 }
 
 // Types
-
-/**
- * Enum representing the type of handler (ExportedHandler or WorkerEntrypoint)
- */
-enum HandlerType {
-  EXPORTED_HANDLER,
-  WORKER_ENTRYPOINT,
-}
 
 /**
  * Enum representing OAuth grant types
@@ -30,30 +116,27 @@ export enum GrantType {
   TOKEN_EXCHANGE = 'urn:ietf:params:oauth:grant-type:token-exchange',
 }
 
-/** ExecutionContext with writable props — ctx.props is read-only in types but writable at runtime */
-type MutableExecutionContext = Omit<ExecutionContext, 'props'> & { props: any };
+/**
+ * Context passed to API handlers with authenticated request properties.
+ */
+export interface OAuthContext {
+  /** Decrypted application-specific properties from the access token */
+  props: any;
+}
 
 /**
- * Aliases for either type of Handler that makes .fetch required
+ * Handler for API requests that have been authenticated with a valid access token.
  */
-type ExportedHandlerWithFetch<Env = Cloudflare.Env> = ExportedHandler<Env> &
-  Pick<Required<ExportedHandler<Env>>, 'fetch'>;
-type WorkerEntrypointWithFetch<Env = Cloudflare.Env> = WorkerEntrypoint<Env> & {
-  fetch: NonNullable<WorkerEntrypoint['fetch']>;
-};
+export interface ApiHandler {
+  fetch(request: Request, ctx: OAuthContext): Promise<Response>;
+}
 
 /**
- * Discriminated union type for handlers
+ * Handler for non-API requests (authorization pages, etc.)
  */
-type TypedHandler<Env = Cloudflare.Env> =
-  | {
-      type: HandlerType.EXPORTED_HANDLER;
-      handler: ExportedHandlerWithFetch<Env>;
-    }
-  | {
-      type: HandlerType.WORKER_ENTRYPOINT;
-      handler: new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>;
-    };
+export interface DefaultHandler {
+  fetch(request: Request): Promise<Response>;
+}
 
 /**
  * Configuration options for the OAuth Provider
@@ -135,6 +218,23 @@ export interface TokenExchangeCallbackOptions {
    * Application-specific properties currently associated with this grant
    */
   props: any;
+
+  /**
+   * The actor token, if present in the request (RFC 8693 Section 2.1).
+   * Represents the party acting on behalf of the subject.
+   */
+  actorToken?: string;
+
+  /**
+   * The actor token type URI, if actor_token was provided.
+   */
+  actorTokenType?: string;
+
+  /**
+   * Resolved actor token information, if actor_token was a valid internal access token.
+   * Contains the decrypted props and claims from the actor's token.
+   */
+  actorTokenInfo?: TokenSummary;
 }
 
 /**
@@ -150,11 +250,6 @@ export interface ResolveExternalTokenInput {
    * The original HTTP request
    */
   request: Request;
-
-  /**
-   * Cloudflare Worker environment variables
-   */
-  env: any;
 }
 
 /**
@@ -175,7 +270,12 @@ export interface ResolveExternalTokenResult {
   audience?: string | string[];
 }
 
-export interface OAuthProviderOptions<Env = Cloudflare.Env> {
+export interface OAuthProviderOptions {
+  /**
+   * Storage adapter for persisting OAuth data (clients, grants, tokens).
+   */
+  storage: StorageAdapter;
+
   /**
    * URL(s) for API routes. Requests with URLs starting with any of these prefixes
    * will be treated as API requests and require a valid access token.
@@ -189,35 +289,27 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * Handler for API requests that have a valid access token.
    * This handler will receive the authenticated user properties in ctx.props.
-   * Can be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint.
    *
    * Used with `apiRoute` for the single-handler configuration. This is incompatible with
    * the `apiHandlers` property. You must use either `apiRoute` + `apiHandler` OR `apiHandlers`, not both.
    */
-  apiHandler?:
-    | ExportedHandlerWithFetch<Env>
-    | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
+  apiHandler?: ApiHandler;
 
   /**
    * Map of API routes to their corresponding handlers for the multi-handler configuration.
    * The keys are the API routes (strings only, not arrays), and the values are the handlers.
-   * Each route can be a full URL or just a path, and each handler can be either an ExportedHandler
-   * object with a fetch method or a class extending WorkerEntrypoint.
+   * Each route can be a full URL or just a path.
    *
    * This is incompatible with the `apiRoute` and `apiHandler` properties. You must use either
    * `apiRoute` + `apiHandler` (single-handler configuration) OR `apiHandlers` (multi-handler
    * configuration), not both.
    */
-  apiHandlers?: Record<
-    string,
-    ExportedHandlerWithFetch<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>)
-  >;
+  apiHandlers?: Record<string, ApiHandler>;
 
   /**
    * Handler for all non-API requests or API requests without a valid token.
-   * Can be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint.
    */
-  defaultHandler: ExportedHandler<Env> | (new (ctx: ExecutionContext, env: Env) => WorkerEntrypointWithFetch<Env>);
+  defaultHandler: DefaultHandler;
 
   /**
    * URL of the OAuth authorization endpoint where users can grant permissions.
@@ -245,10 +337,27 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
 
   /**
    * Time-to-live for refresh tokens in seconds.
-   * If not specified, refresh tokens do not expire.
-   * For example: 3600 = 1 hour, 2592000 = 30 days
+   * Defaults to 0 (refresh tokens disabled).
+   * Set to a positive number to enable refresh tokens with expiration,
+   * or undefined for refresh tokens that do not expire.
    */
   refreshTokenTTL?: number;
+
+  /**
+   * Grace period in seconds during which the previous refresh token
+   * remains valid after rotation. Only applies when refresh token rotation is active.
+   * After this period, only the current refresh token is accepted.
+   * Defaults to undefined (previous token valid until new token is first used).
+   * Set to 0 to immediately invalidate the previous token on rotation.
+   */
+  refreshTokenGracePeriod?: number;
+
+  /**
+   * When true, if a previously-rotated refresh token is reused after being fully
+   * superseded (replay detected), the entire grant is revoked as a security measure.
+   * Defaults to false.
+   */
+  revokeGrantOnRefreshTokenReplay?: boolean;
 
   /**
    * List of scopes supported by this OAuth provider.
@@ -267,7 +376,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
    * Controls whether the plain PKCE method is allowed.
    * OAuth 2.1 recommends using S256 exclusively as plain offers no cryptographic protection.
    * When set to false, only the S256 code_challenge_method will be accepted.
-   * Defaults to true for backward compatibility.
+   * Defaults to false.
    */
   allowPlainPKCE?: boolean;
 
@@ -301,7 +410,7 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   ) => Promise<TokenExchangeCallbackResult | void> | TokenExchangeCallbackResult | void;
 
   /**
-   * Optional callback function that is called when a provided token was not found in the internal KV.
+   * Optional callback function that is called when a provided token was not found in the internal storage.
    * This allows authentication through external OAuth servers.
    * For example, if a request includes an authenticated token from a different OAuth authentication server,
    * the callback can be used to authenticate it and set the context props through it.
@@ -327,10 +436,18 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   /**
    * Explicitly enable Client ID Metadata Document (CIMD) support.
    * When true, URL-formatted client_ids will be fetched as metadata documents.
-   * Requires the 'global_fetch_strictly_public' compatibility flag.
    * Defaults to false.
    */
   clientIdMetadataDocumentEnabled?: boolean;
+
+  /**
+   * TTL in seconds for caching fetched Client ID Metadata Documents in the StorageAdapter.
+   * When set to a positive number, CIMD responses are cached to avoid repeated HTTP fetches.
+   * On fetch failure, a stale cached entry will be served if available.
+   * Set to 0 or leave undefined to disable caching (current behavior).
+   * Defaults to 0.
+   */
+  cimdCacheTtl?: number;
 
   /**
    * Optional metadata for RFC 9728 OAuth 2.0 Protected Resource Metadata.
@@ -368,12 +485,8 @@ export interface OAuthProviderOptions<Env = Cloudflare.Env> {
   };
 }
 
-// Using ExportedHandler from Cloudflare Workers Types for both API and default handlers
-// This is Cloudflare's built-in type for Workers handlers with a fetch method
-// For ApiHandler, ctx will include ctx.props with user properties
-
 /**
- * Helper methods for OAuth operations provided to handler functions
+ * Helper methods for OAuth operations
  */
 export interface OAuthHelpers {
   /**
@@ -482,6 +595,17 @@ export interface ExchangeTokenOptions {
    * Optional TTL override for the new token in seconds (must not exceed subject token's remaining lifetime)
    */
   expiresIn?: number;
+
+  /**
+   * The actor token for delegation/impersonation scenarios (RFC 8693 Section 2.1)
+   */
+  actorToken?: string;
+
+  /**
+   * The actor token type URI. Required if actorToken is provided.
+   * Defaults to 'urn:ietf:params:oauth:token-type:access_token'.
+   */
+  actorTokenType?: string;
 }
 
 /**
@@ -716,6 +840,12 @@ export interface Grant {
   previousRefreshTokenWrappedKey?: string;
 
   /**
+   * Unix timestamp when the previous refresh token was rotated out.
+   * Used with refreshTokenGracePeriod to time-limit previous token validity.
+   */
+  previousRefreshTokenRotatedAt?: number;
+
+  /**
    * The hash of the authorization code associated with this grant
    * Only present during the authorization code exchange process
    */
@@ -805,7 +935,7 @@ export interface TokenBase {
 }
 
 /**
- * Token record stored in KV
+ * Token record stored in storage
  * Note: The actual token format is "{userId}:{grantId}:{random-secret}"
  * but we still only store the hash of the full token string.
  * This contains only access tokens; refresh tokens are stored within the grant records.
@@ -977,51 +1107,89 @@ interface CreateAccessTokenOptions {
    * Optional audience/resource
    */
   audience?: string | string[];
-
-  /**
-   * Cloudflare Worker environment variables
-   */
-  env: any;
 }
 
 /**
- * OAuth 2.0 Provider implementation for Cloudflare Workers
+ * OAuth 2.0 Provider implementation.
  * Implements authorization code flow with support for refresh tokens
  * and dynamic client registration.
  */
-export class OAuthProvider<Env = Cloudflare.Env> {
-  #impl: OAuthProviderImpl<Env>;
+export class OAuthProvider implements OAuthHelpers {
+  #impl: OAuthProviderImpl;
+  #helpers: OAuthHelpersImpl;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions<Env>) {
-    this.#impl = new OAuthProviderImpl<Env>(options);
+  constructor(options: OAuthProviderOptions) {
+    this.#impl = new OAuthProviderImpl(options);
+    this.#helpers = this.#impl.createOAuthHelpers();
   }
 
   /**
-   * Main fetch handler for the Worker
+   * Main fetch handler
    * Routes requests to the appropriate handler based on the URL
    * @param request - The HTTP request
-   * @param env - Cloudflare Worker environment variables
-   * @param ctx - Cloudflare Worker execution context
    * @returns A Promise resolving to an HTTP Response
    */
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return this.#impl.fetch(request, env, ctx);
+  fetch(request: Request): Promise<Response> {
+    return this.#impl.fetch(request);
   }
-}
 
-/**
- * Gets OAuthHelpers for the given environment
- * @param options - Configuration options for the OAuth provider
- * @param env - Cloudflare Worker environment variables
- * @returns An instance of OAuthHelpers
- */
-export function getOAuthApi<Env = Cloudflare.Env>(options: OAuthProviderOptions<Env>, env: Env): OAuthHelpers {
-  const impl = new OAuthProviderImpl<Env>(options);
-  return impl.createOAuthHelpers(env);
+  // OAuthHelpers methods delegated to the internal helpers instance
+
+  parseAuthRequest(request: Request): Promise<AuthRequest> {
+    return this.#helpers.parseAuthRequest(request);
+  }
+
+  lookupClient(clientId: string): Promise<ClientInfo | null> {
+    return this.#helpers.lookupClient(clientId);
+  }
+
+  completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
+    return this.#helpers.completeAuthorization(options);
+  }
+
+  createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo> {
+    return this.#helpers.createClient(clientInfo);
+  }
+
+  listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
+    return this.#helpers.listClients(options);
+  }
+
+  updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
+    return this.#helpers.updateClient(clientId, updates);
+  }
+
+  deleteClient(clientId: string): Promise<void> {
+    return this.#helpers.deleteClient(clientId);
+  }
+
+  listUserGrants(userId: string, options?: ListOptions): Promise<ListResult<GrantSummary>> {
+    return this.#helpers.listUserGrants(userId, options);
+  }
+
+  revokeGrant(grantId: string, userId: string): Promise<void> {
+    return this.#helpers.revokeGrant(grantId, userId);
+  }
+
+  unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
+    return this.#helpers.unwrapToken(token);
+  }
+
+  /**
+   * Returns the configured external token resolver, if any.
+   * Intended for framework adapters that need to mirror `fetch()` authentication behavior.
+   */
+  getResolveExternalToken(): OAuthProviderOptions['resolveExternalToken'] {
+    return this.#impl.getResolveExternalToken();
+  }
+
+  exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
+    return this.#helpers.exchangeToken(options);
+  }
 }
 
 /**
@@ -1032,31 +1200,37 @@ export function getOAuthApi<Env = Cloudflare.Env>(options: OAuthProviderOptions<
  * annotation, and does not actually prevent the method from being called from outside the class,
  * including over RPC.
  */
-class OAuthProviderImpl<Env = Cloudflare.Env> {
+class OAuthProviderImpl {
   /**
    * Configuration options for the provider
    */
-  options: OAuthProviderOptions<Env>;
+  options: OAuthProviderOptions;
 
   /**
-   * Represents the validated type of a handler (ExportedHandler or WorkerEntrypoint)
+   * Storage adapter for persisting OAuth data
    */
-  private typedDefaultHandler: TypedHandler<Env>;
+  storage: StorageAdapter;
+
+  /**
+   * Default handler for non-API requests
+   */
+  private defaultHandler: DefaultHandler;
 
   /**
    * Array of tuples of API routes and their validated handlers
-   * In the simple case, this will be a single entry with the route and handler from options.apiRoute/apiHandler
-   * In the advanced case, this will contain entries from options.apiHandlers
    */
-  private typedApiHandlers: Array<[string, TypedHandler<Env>]>;
+  private apiHandlers: Array<[string, ApiHandler]>;
 
   /**
    * Creates a new OAuth provider instance
    * @param options - Configuration options for the provider
    */
-  constructor(options: OAuthProviderOptions<Env>) {
-    // Initialize typedApiHandlers as an array
-    this.typedApiHandlers = [];
+  constructor(options: OAuthProviderOptions) {
+    // Store storage adapter
+    this.storage = options.storage;
+
+    // Initialize apiHandlers as an array
+    this.apiHandlers = [];
 
     // Check if we have incompatible configuration
     const hasSingleHandlerConfig = !!(options.apiRoute && options.apiHandler);
@@ -1076,28 +1250,30 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Validate default handler
-    this.typedDefaultHandler = this.validateHandler(options.defaultHandler, 'defaultHandler');
+    this.validateHandler(options.defaultHandler, 'defaultHandler');
+    this.defaultHandler = options.defaultHandler;
 
     // Process and validate the API handlers
     if (hasSingleHandlerConfig) {
       // Single handler mode with apiRoute + apiHandler
-      const apiHandler = this.validateHandler(options.apiHandler!, 'apiHandler');
+      this.validateHandler(options.apiHandler!, 'apiHandler');
 
       // For single handler mode, process the apiRoute(s) and map them all to the single apiHandler
       if (Array.isArray(options.apiRoute)) {
         options.apiRoute.forEach((route, index) => {
           this.validateEndpoint(route, `apiRoute[${index}]`);
-          this.typedApiHandlers.push([route, apiHandler]);
+          this.apiHandlers.push([route, options.apiHandler!]);
         });
       } else {
         this.validateEndpoint(options.apiRoute!, 'apiRoute');
-        this.typedApiHandlers.push([options.apiRoute!, apiHandler]);
+        this.apiHandlers.push([options.apiRoute!, options.apiHandler!]);
       }
     } else {
       // Multiple handlers mode with apiHandlers map
       for (const [route, handler] of Object.entries(options.apiHandlers!)) {
         this.validateEndpoint(route, `apiHandlers key: ${route}`);
-        this.typedApiHandlers.push([route, this.validateHandler(handler, `apiHandlers[${route}]`)]);
+        this.validateHandler(handler, `apiHandlers[${route}]`);
+        this.apiHandlers.push([route, handler]);
       }
     }
 
@@ -1110,26 +1286,35 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     this.options = {
       accessTokenTTL: DEFAULT_ACCESS_TOKEN_TTL,
+      refreshTokenTTL: 0,
+      allowPlainPKCE: false,
       onError: ({ status, code, description }) =>
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
   }
 
+  getResolveExternalToken(): OAuthProviderOptions['resolveExternalToken'] {
+    return this.options.resolveExternalToken;
+  }
+
+  /**
+   * Helper to get a JSON value from storage
+   */
+  private async storageGetJson<T>(key: string): Promise<T | null> {
+    const raw = await this.storage.get(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  }
+
   /**
    * Validates that an endpoint is either an absolute path or a full URL
-   * @param endpoint - The endpoint to validate
-   * @param name - The name of the endpoint property for error messages
-   * @throws TypeError if the endpoint is invalid
    */
   private validateEndpoint(endpoint: string, name: string): void {
     if (this.isPath(endpoint)) {
-      // It should be an absolute path starting with /
       if (!endpoint.startsWith('/')) {
         throw new TypeError(`${name} path must be an absolute path starting with /`);
       }
     } else {
-      // It should be a valid URL
       try {
         new URL(endpoint);
       } catch (e) {
@@ -1139,37 +1324,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   }
 
   /**
-   * Validates that a handler is either an ExportedHandler or a class extending WorkerEntrypoint
-   * @param handler - The handler to validate
-   * @param name - The name of the handler property for error messages
-   * @returns The type of the handler (EXPORTED_HANDLER or WORKER_ENTRYPOINT)
-   * @throws TypeError if the handler is invalid
+   * Validates that a handler has a fetch method
    */
-  private validateHandler(handler: any, name: string): TypedHandler<Env> {
+  private validateHandler(handler: any, name: string): void {
     if (typeof handler === 'object' && handler !== null && typeof handler.fetch === 'function') {
-      // It's an ExportedHandler object
-      return { type: HandlerType.EXPORTED_HANDLER, handler };
+      return;
     }
-
-    // Check if it's a class constructor extending WorkerEntrypoint
-    if (typeof handler === 'function' && handler.prototype instanceof WorkerEntrypoint) {
-      return { type: HandlerType.WORKER_ENTRYPOINT, handler };
-    }
-
-    throw new TypeError(
-      `${name} must be either an ExportedHandler object with a fetch method or a class extending WorkerEntrypoint`
-    );
+    throw new TypeError(`${name} must be an object with a fetch method`);
   }
 
   /**
-   * Main fetch handler for the Worker
+   * Main fetch handler
    * Routes requests to the appropriate handler based on the URL
-   * @param request - The HTTP request
-   * @param env - Cloudflare Worker environment variables
-   * @param ctx - Cloudflare Worker execution context
-   * @returns A Promise resolving to an HTTP Response
    */
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     // Special handling for OPTIONS requests (CORS preflight)
@@ -1209,7 +1377,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Handle token endpoint (including revocation)
     if (this.isTokenEndpoint(url)) {
-      const parsed = await this.parseTokenEndpointRequest(request, env);
+      const parsed = await this.parseTokenEndpointRequest(request);
 
       // If parsing failed, return the error response
       if (parsed instanceof Response) {
@@ -1218,9 +1386,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
       let response: Response;
       if (parsed.isRevocationRequest) {
-        response = await this.handleRevocationRequest(parsed.body, env);
+        response = await this.handleRevocationRequest(parsed.body);
       } else {
-        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo, env);
+        response = await this.handleTokenRequest(parsed.body, parsed.clientInfo);
       }
 
       return this.addCorsHeaders(response, request);
@@ -1228,44 +1396,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Handle client registration endpoint
     if (this.options.clientRegistrationEndpoint && this.isClientRegistrationEndpoint(url)) {
-      const response = await this.handleClientRegistration(request, env);
+      const response = await this.handleClientRegistration(request);
       return this.addCorsHeaders(response, request);
     }
 
     // Check if it's an API request
     if (this.isApiRequest(url)) {
-      const response = await this.handleApiRequest(request, env, ctx);
+      const response = await this.handleApiRequest(request);
       return this.addCorsHeaders(response, request);
     }
 
-    // Inject OAuth helpers into env if not already present
-    if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
-      (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
-    }
-
-    // Call the default handler based on its type
+    // Call the default handler
     // Note: We don't add CORS headers to default handler responses
-    if (this.typedDefaultHandler.type === HandlerType.EXPORTED_HANDLER) {
-      // It's an object with a fetch method
-      return this.typedDefaultHandler.handler.fetch(
-        request as Parameters<ExportedHandlerWithFetch<Env>['fetch']>[0],
-        env,
-        ctx
-      );
-    } else {
-      // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
-      const handler = new this.typedDefaultHandler.handler(ctx, env);
-      return handler.fetch(request);
-    }
+    return this.defaultHandler.fetch(request);
   }
 
   /**
    * Decodes a token and returns token data with decrypted props
-   * @param token - The granted token
-   * @param env - Cloudflare Worker environment variables
-   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
    */
-  async unwrapToken<T = any>(token: string, env: any): Promise<TokenSummary<T> | null> {
+  async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
     const parts = token.split(':');
     const isPossiblyInternalFormat = parts.length === 3;
 
@@ -1273,10 +1422,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return null;
     }
 
-    // Retrieve the token from KV
+    // Retrieve the token from storage
     const [userId, grantId] = parts;
     const id = await generateTokenId(token);
-    const tokenData: Token | null = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+    const tokenData = await this.storageGetJson<Token>(`token:${userId}:${grantId}:${id}`);
 
     // Return null if missing or expired
     if (!tokenData) {
@@ -1300,7 +1449,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       createdAt: tokenData.createdAt,
       expiresAt: tokenData.expiresAt,
       audience: tokenData.audience,
-      scope: tokenData.scope || grant.scope, // Use token scope if available, fallback to grant scope for backward compatibility
+      scope: tokenData.scope || grant.scope,
       grant: {
         clientId: grant.clientId,
         scope: grant.scope,
@@ -1311,8 +1460,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Determines if an endpoint configuration is a path or a full URL
-   * @param endpoint - The endpoint configuration
-   * @returns True if the endpoint is a path (starts with /), false if it's a full URL
    */
   private isPath(endpoint: string): boolean {
     return endpoint.startsWith('/');
@@ -1320,16 +1467,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Matches a URL against an endpoint pattern that can be a full URL or just a path
-   * @param url - The URL to check
-   * @param endpoint - The endpoint pattern (full URL or path)
-   * @returns True if the URL matches the endpoint pattern
    */
   private matchEndpoint(url: URL, endpoint: string): boolean {
     if (this.isPath(endpoint)) {
-      // It's a path - match only the pathname
       return url.pathname === endpoint;
     } else {
-      // It's a full URL - match the entire URL including hostname
       const endpointUrl = new URL(endpoint);
       return url.hostname === endpointUrl.hostname && url.pathname === endpointUrl.pathname;
     }
@@ -1337,8 +1479,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL matches the configured token endpoint
-   * @param url - The URL to check
-   * @returns True if the URL matches the token endpoint
    */
   private isTokenEndpoint(url: URL): boolean {
     return this.matchEndpoint(url, this.options.tokenEndpoint);
@@ -1346,8 +1486,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL matches the configured client registration endpoint
-   * @param url - The URL to check
-   * @returns True if the URL matches the client registration endpoint
    */
   private isClientRegistrationEndpoint(url: URL): boolean {
     if (!this.options.clientRegistrationEndpoint) return false;
@@ -1356,13 +1494,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Parses and validates a token endpoint request (used for both token exchange and revocation)
-   * @param request - The HTTP request to parse
-   * @returns Promise with parsed body and client info, or error response
    */
-  private async parseTokenEndpointRequest(
-    request: Request,
-    env: any
-  ): Promise<
+  private async parseTokenEndpointRequest(request: Request): Promise<
     | {
         body: any;
         clientInfo: ClientInfo;
@@ -1376,12 +1509,13 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     let contentType = request.headers.get('Content-Type') || '';
-    let body: any = {};
 
     // According to OAuth 2.0 RFC 6749/7009, requests MUST use application/x-www-form-urlencoded
     if (!contentType.includes('application/x-www-form-urlencoded')) {
       return this.createErrorResponse('invalid_request', 'Content-Type must be application/x-www-form-urlencoded', 400);
     }
+
+    let body: any = {};
 
     // Process application/x-www-form-urlencoded
     const formData = await request.formData();
@@ -1413,7 +1547,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     }
 
     // Verify client exists
-    const clientInfo = await this.getClient(env, clientId);
+    const clientInfo = await this.getClient(clientId);
     if (!clientInfo) {
       return this.createErrorResponse('invalid_client', 'Client not found', 401);
     }
@@ -1455,20 +1589,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL matches a specific API route
-   * @param url - The URL to check
-   * @param route - The API route to check against
-   * @returns True if the URL matches the API route
    */
   private matchApiRoute(url: URL, route: string): boolean {
     if (this.isPath(route)) {
-      // It's a path - match only the pathname
-      // Special case: '/' should match exactly, not all paths (which would break OAuth routes)
       if (route === '/') {
         return url.pathname === '/';
       }
       return url.pathname.startsWith(route);
     } else {
-      // It's a full URL - match the entire URL including hostname
       const apiUrl = new URL(route);
       return url.hostname === apiUrl.hostname && url.pathname.startsWith(apiUrl.pathname);
     }
@@ -1476,12 +1604,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Checks if a URL is an API request based on the configured API route(s)
-   * @param url - The URL to check
-   * @returns True if the URL matches any of the API routes
    */
   private isApiRequest(url: URL): boolean {
-    // Check each route in our array of validated API handlers
-    for (const [route, _] of this.typedApiHandlers) {
+    for (const [route, _] of this.apiHandlers) {
       if (this.matchApiRoute(url, route)) {
         return true;
       }
@@ -1491,12 +1616,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Finds the appropriate API handler for a URL
-   * @param url - The URL to find a handler for
-   * @returns The TypedHandler for the URL, or undefined if no handler matches
    */
-  private findApiHandlerForUrl(url: URL): TypedHandler<Env> | undefined {
-    // Check each route in our array of validated API handlers
-    for (const [route, handler] of this.typedApiHandlers) {
+  private findApiHandlerForUrl(url: URL): ApiHandler | undefined {
+    for (const [route, handler] of this.apiHandlers) {
       if (this.matchApiRoute(url, route)) {
         return handler;
       }
@@ -1507,45 +1629,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Gets the full URL for an endpoint, using the provided request URL's
    * origin for endpoints specified as just paths
-   * @param endpoint - The endpoint configuration (path or full URL)
-   * @param requestUrl - The URL of the incoming request
-   * @returns The full URL for the endpoint
    */
   private getFullEndpointUrl(endpoint: string, requestUrl: URL): string {
     if (this.isPath(endpoint)) {
-      // It's a path - use the request URL's origin
       return `${requestUrl.origin}${endpoint}`;
     } else {
-      // It's already a full URL
       return endpoint;
     }
   }
 
   /**
    * Adds CORS headers to a response
-   * @param response - The response to add CORS headers to
-   * @param request - The original request
-   * @returns A new Response with CORS headers added
    */
   private addCorsHeaders(response: Response, request: Request): Response {
-    // Get the Origin header from the request
     const origin = request.headers.get('Origin');
-
-    // If there's no Origin header, return the original response
     if (!origin) {
       return response;
     }
 
-    // Create a new response that copies all properties from the original response
-    // This makes the response mutable so we can modify its headers
     const newResponse = new Response(response.body, response);
-
-    // Add CORS headers
     newResponse.headers.set('Access-Control-Allow-Origin', origin);
     newResponse.headers.set('Access-Control-Allow-Methods', '*');
-    // Include Authorization explicitly since it's not included in * for security reasons
     newResponse.headers.set('Access-Control-Allow-Headers', 'Authorization, *');
-    newResponse.headers.set('Access-Control-Max-Age', '86400'); // 24 hours
+    newResponse.headers.set('Access-Control-Max-Age', '86400');
 
     return newResponse;
   }
@@ -1553,11 +1659,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Handles the OAuth metadata discovery endpoint
    * Implements RFC 8414 for OAuth Server Metadata
-   * @param requestUrl - The URL of the incoming request
-   * @returns Response with OAuth server metadata
    */
   private async handleMetadataDiscovery(requestUrl: URL): Promise<Response> {
-    // For endpoints specified as paths, use the request URL's origin
     const tokenEndpoint = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authorizeEndpoint = this.getFullEndpointUrl(this.options.authorizeEndpoint, requestUrl);
 
@@ -1568,8 +1671,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Determine supported response types
     const responseTypesSupported = ['code'];
-
-    // Add token response type if implicit flow is allowed
     if (this.options.allowImplicitFlow) {
       responseTypesSupported.push('token');
     }
@@ -1584,30 +1685,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       issuer: new URL(tokenEndpoint).origin,
       authorization_endpoint: authorizeEndpoint,
       token_endpoint: tokenEndpoint,
-      // not implemented: jwks_uri
       registration_endpoint: registrationEndpoint,
       scopes_supported: this.options.scopesSupported,
       response_types_supported: responseTypesSupported,
       response_modes_supported: ['query'],
       grant_types_supported: grantTypesSupported,
-      // Support "none" auth method for public clients
       token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
-      // not implemented: token_endpoint_auth_signing_alg_values_supported
-      // not implemented: service_documentation
-      // not implemented: ui_locales_supported
-      // not implemented: op_policy_uri
-      // not implemented: op_tos_uri
-      revocation_endpoint: tokenEndpoint, // Reusing token endpoint for revocation
-      // not implemented: revocation_endpoint_auth_methods_supported
-      // not implemented: revocation_endpoint_auth_signing_alg_values_supported
-      // not implemented: introspection_endpoint
-      // not implemented: introspection_endpoint_auth_methods_supported
-      // not implemented: introspection_endpoint_auth_signing_alg_values_supported
-      code_challenge_methods_supported: this.options.allowPlainPKCE !== false ? ['plain', 'S256'] : ['S256'], // PKCE support
-      // MCP Client ID Metadata Document support (CIMD)
-      // Only enabled when global_fetch_strictly_public compat flag is set (for SSRF protection)
-      client_id_metadata_document_supported:
-        !!this.options.clientIdMetadataDocumentEnabled && this.hasGlobalFetchStrictlyPublic(),
+      revocation_endpoint: tokenEndpoint,
+      code_challenge_methods_supported: this.options.allowPlainPKCE ? ['plain', 'S256'] : ['S256'],
+      client_id_metadata_document_supported: !!this.options.clientIdMetadataDocumentEnabled,
     };
 
     return new Response(JSON.stringify(metadata), {
@@ -1618,13 +1704,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
   /**
    * Handles the OAuth Protected Resource Metadata endpoint
    * Implements RFC 9728 for OAuth Protected Resource Metadata
-   * @param requestUrl - The URL of the incoming request
-   * @returns Response with protected resource metadata
    */
   private handleProtectedResourceMetadata(requestUrl: URL): Response {
     const rm = this.options.resourceMetadata;
 
-    // Derive authorization server from token endpoint, same as issuer in auth server metadata
     const tokenEndpointUrl = this.getFullEndpointUrl(this.options.tokenEndpoint, requestUrl);
     const authServerOrigin = new URL(tokenEndpointUrl).origin;
 
@@ -1646,22 +1729,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Handles client authentication and token issuance via the token endpoint
-   * Supports authorization_code and refresh_token grant types
-   * @param body - The parsed request body
-   * @param clientInfo - The authenticated client information
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response with token data or error
    */
-  private async handleTokenRequest(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
-    // Handle different grant types
+  private async handleTokenRequest(body: any, clientInfo: ClientInfo): Promise<Response> {
     const grantType = body.grant_type;
 
     if (grantType === GrantType.AUTHORIZATION_CODE) {
-      return this.handleAuthorizationCodeGrant(body, clientInfo, env);
+      return this.handleAuthorizationCodeGrant(body, clientInfo);
     } else if (grantType === GrantType.REFRESH_TOKEN) {
-      return this.handleRefreshTokenGrant(body, clientInfo, env);
+      return this.handleRefreshTokenGrant(body, clientInfo);
     } else if (grantType === GrantType.TOKEN_EXCHANGE && this.options.allowTokenExchangeGrant) {
-      return this.handleTokenExchangeGrant(body, clientInfo, env);
+      return this.handleTokenExchangeGrant(body, clientInfo);
     } else {
       return this.createErrorResponse('unsupported_grant_type', 'Grant type not supported');
     }
@@ -1669,13 +1746,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Handles the authorization code grant type
-   * Exchanges an authorization code for access and refresh tokens
-   * @param body - The parsed request body
-   * @param clientInfo - The authenticated client information
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response with token data or error
    */
-  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleAuthorizationCodeGrant(body: any, clientInfo: ClientInfo): Promise<Response> {
     const code = body.code;
     const redirectUri = body.redirect_uri;
     const codeVerifier = body.code_verifier;
@@ -1694,21 +1766,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     // Get the grant
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await this.storageGetJson<Grant>(grantKey);
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found or authorization code expired');
     }
 
     // Verify that the grant contains an auth code hash
-    // If absent, the authorization code has been previously exchanged.
-    // Per RFC 6749 Section 10.5, revoke all tokens issued from the first
-    // exchange as a precaution against authorization code replay attacks.
     if (!grantData.authCodeId) {
       try {
-        await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+        await this.createOAuthHelpers().revokeGrant(grantId, userId);
       } catch {
-        // Best-effort revocation — always return invalid_grant per RFC 6749 §10.5
+        // Best-effort revocation
       }
       return this.createErrorResponse('invalid_grant', 'Authorization code already used');
     }
@@ -1748,18 +1817,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         return this.createErrorResponse('invalid_request', 'code_verifier is required for PKCE');
       }
 
-      // Verify the code verifier against the stored code challenge
       let calculatedChallenge: string;
 
       if (grantData.codeChallengeMethod === 'S256') {
-        // SHA-256 transformation for S256 method
         const encoder = new TextEncoder();
         const data = encoder.encode(codeVerifier);
         const hashBuffer = await crypto.subtle.digest('SHA-256', data);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         calculatedChallenge = base64UrlEncode(String.fromCharCode(...hashArray));
       } else {
-        // Plain method, direct comparison
         calculatedChallenge = codeVerifier;
       }
 
@@ -1782,15 +1848,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
     // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
     let tokenScopes: string[] = this.downscope(body.scope, grantData.scope);
 
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
-      // Decrypt the existing props to provide them to the callback
       const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
 
-      // Default to using the original props for both grant and token
       let grantProps = decryptedProps;
       let accessTokenProps = decryptedProps;
 
@@ -1806,33 +1869,25 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
 
       if (callbackResult) {
-        // Use the returned props if provided, otherwise keep the original props
         if (callbackResult.newProps) {
           grantProps = callbackResult.newProps;
-
-          // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
-          // This ensures token props are updated when only newProps are specified
           if (!callbackResult.accessTokenProps) {
             accessTokenProps = callbackResult.newProps;
           }
         }
 
-        // If accessTokenProps was explicitly specified, use those
         if (callbackResult.accessTokenProps) {
           accessTokenProps = callbackResult.accessTokenProps;
         }
 
-        // If accessTokenTTL was specified, use that for this token
         if (callbackResult.accessTokenTTL !== undefined) {
           accessTokenTTL = callbackResult.accessTokenTTL;
         }
 
-        // If refreshTokenTTL was specified, use that for this grant
         if ('refreshTokenTTL' in callbackResult) {
           refreshTokenTTL = callbackResult.refreshTokenTTL;
         }
 
-        // If accessTokenScope was specified, use it for this token
         if (callbackResult.accessTokenScope) {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
@@ -1849,22 +1904,18 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         encryptedAccessTokenProps = tokenResult.encryptedData;
         accessTokenEncryptionKey = tokenResult.key;
       } else {
-        // If they're the same, use the grant's encrypted data and key
         encryptedAccessTokenProps = grantData.encryptedProps;
         accessTokenEncryptionKey = grantEncryptionKey;
       }
     }
 
-    // Calculate the access token expiration time (after callback might have updated TTL)
+    // Calculate the access token expiration time
     const now = Math.floor(Date.now() / 1000);
 
     // Determine if we should issue a refresh token
     const useRefreshToken = refreshTokenTTL !== 0;
 
-    // Update the grant:
-    // - Remove the auth code hash (it's single-use)
-    // - Remove PKCE-related fields (one-time use)
-    // - Remove auth code wrapped key (no longer needed)
+    // Update the grant: remove auth code fields
     delete grantData.authCodeId;
     delete grantData.codeChallenge;
     delete grantData.codeChallengeMethod;
@@ -1879,27 +1930,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const refreshTokenId = await generateTokenId(refreshToken);
       const refreshTokenWrappedKey = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
 
-      // Calculate expiration if TTL is defined
       const expiresAt = refreshTokenTTL !== undefined ? now + refreshTokenTTL : undefined;
 
-      // Add refresh token data to grant
       grantData.refreshTokenId = refreshTokenId;
       grantData.refreshTokenWrappedKey = refreshTokenWrappedKey;
-      grantData.previousRefreshTokenId = undefined; // No previous token for first use
-      grantData.previousRefreshTokenWrappedKey = undefined; // No previous token for first use
+      grantData.previousRefreshTokenId = undefined;
+      grantData.previousRefreshTokenWrappedKey = undefined;
       grantData.expiresAt = expiresAt;
     }
 
-    // Save the updated grant with TTL matching refresh token expiration (if any)
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
+    // Save the updated grant
+    await this.saveGrantWithTTL(grantKey, grantData, now);
 
     // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
-      // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
         if (!grantedResources.includes(requested)) {
           return this.createErrorResponse(
@@ -1910,17 +1957,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Use resource from token request if provided, otherwise use resource from grant
     const audience = parseResourceParameter(body.resource || grantData.resource);
     if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
       return this.createErrorResponse(
         'invalid_target',
         'The resource parameter must be a valid absolute URI without a fragment'
       );
     }
 
-    // Create and store access token with potentially narrowed scopes
+    // Create and store access token
     const accessToken = await this.createAccessToken({
       userId,
       grantId,
@@ -1930,7 +1975,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
       audience,
-      env,
     });
 
     // Build the response
@@ -1945,12 +1989,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       tokenResponse.refresh_token = refreshToken;
     }
 
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
     if (audience) {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
       headers: { 'Content-Type': 'application/json' },
     });
@@ -1958,47 +2000,51 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Handles the refresh token grant type
-   * Issues a new access token using a refresh token
-   * @param body - The parsed request body
-   * @param clientInfo - The authenticated client information
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response with token data or error
    */
-  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleRefreshTokenGrant(body: any, clientInfo: ClientInfo): Promise<Response> {
     const refreshToken = body.refresh_token;
 
     if (!refreshToken) {
       return this.createErrorResponse('invalid_request', 'Refresh token is required');
     }
 
-    // Parse the token to extract user ID and grant ID
     const tokenParts = refreshToken.split(':');
     if (tokenParts.length !== 3) {
       return this.createErrorResponse('invalid_grant', 'Invalid token format');
     }
 
     const [userId, grantId, _] = tokenParts;
-
-    // Calculate the token hash
     const providedTokenHash = await generateTokenId(refreshToken);
 
-    // Get the associated grant using userId in the key
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await this.storageGetJson<Grant>(grantKey);
 
     if (!grantData) {
       return this.createErrorResponse('invalid_grant', 'Grant not found');
     }
 
-    // Check if the provided token matches either the current or previous refresh token
     const isCurrentToken = grantData.refreshTokenId === providedTokenHash;
     const isPreviousToken = grantData.previousRefreshTokenId === providedTokenHash;
 
     if (!isCurrentToken && !isPreviousToken) {
+      // Replay detection: token was valid once but has been fully superseded
+      if (this.options.revokeGrantOnRefreshTokenReplay) {
+        await this.createOAuthHelpers().revokeGrant(grantId, userId);
+      }
       return this.createErrorResponse('invalid_grant', 'Invalid refresh token');
     }
 
-    // Verify client ID matches
+    // Check grace period for previous refresh token
+    if (isPreviousToken && this.options.refreshTokenGracePeriod !== undefined) {
+      const rotatedAt = grantData.previousRefreshTokenRotatedAt;
+      if (rotatedAt !== undefined) {
+        const now = Math.floor(Date.now() / 1000);
+        if (now - rotatedAt >= this.options.refreshTokenGracePeriod) {
+          return this.createErrorResponse('invalid_grant', 'Previous refresh token has expired');
+        }
+      }
+    }
+
     if (grantData.clientId !== clientInfo.clientId) {
       return this.createErrorResponse('invalid_grant', 'Client ID mismatch');
     }
@@ -2016,7 +2062,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const newAccessToken = `${userId}:${grantId}:${accessTokenSecret}`;
     const accessTokenId = await generateTokenId(newAccessToken);
 
-    // Define the access token TTL, may be updated by callback if provided
     let accessTokenTTL = this.options.accessTokenTTL!;
 
     // Determine which wrapped key to use for unwrapping
@@ -2027,27 +2072,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       wrappedKeyToUse = grantData.previousRefreshTokenWrappedKey!;
     }
 
-    // Unwrap the encryption key using the refresh token
     const encryptionKey = await unwrapKeyWithToken(refreshToken, wrappedKeyToUse);
 
-    // Default to using the same encryption key and props for both grant and access token
     let grantEncryptionKey = encryptionKey;
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = grantData.encryptedProps;
 
-    // Parse and validate scope parameter for downscoping (RFC 6749 Section 3.3)
-    // The token request can include a scope parameter to request a subset of the granted scopes
     let tokenScopes = this.downscope(body.scope, grantData.scope);
 
-    // Track whether grant props changed
     let grantPropsChanged = false;
 
     // Process token exchange callback if provided
     if (this.options.tokenExchangeCallback) {
-      // Decrypt the existing props to provide them to the callback
       const decryptedProps = await decryptProps(encryptionKey, grantData.encryptedProps);
 
-      // Default to using the original props for both grant and token
       let grantProps = decryptedProps;
       let accessTokenProps = decryptedProps;
 
@@ -2063,29 +2101,22 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
 
       if (callbackResult) {
-        // Use the returned props if provided, otherwise keep the original props
         if (callbackResult.newProps) {
           grantProps = callbackResult.newProps;
           grantPropsChanged = true;
-
-          // If accessTokenProps wasn't explicitly specified, use the updated newProps for the token too
-          // This ensures token props are updated when only newProps are specified
           if (!callbackResult.accessTokenProps) {
             accessTokenProps = callbackResult.newProps;
           }
         }
 
-        // If accessTokenProps was explicitly specified, use those
         if (callbackResult.accessTokenProps) {
           accessTokenProps = callbackResult.accessTokenProps;
         }
 
-        // If accessTokenTTL was specified, use that for this token
         if (callbackResult.accessTokenTTL !== undefined) {
           accessTokenTTL = callbackResult.accessTokenTTL;
         }
 
-        // refreshTokenTTL changes are not supported during refresh token exchange
         if ('refreshTokenTTL' in callbackResult) {
           return this.createErrorResponse(
             'invalid_request',
@@ -2093,19 +2124,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
           );
         }
 
-        // If accessTokenScope was specified, use it for this token
         if (callbackResult.accessTokenScope) {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
 
-      // Only re-encrypt the grant props if they've changed
       if (grantPropsChanged) {
-        // Re-encrypt the updated grant props
         const grantResult = await encryptProps(grantProps);
         grantData.encryptedProps = grantResult.encryptedData;
 
-        // If the encryption key changed, we need to re-wrap the previous token key
         if (grantResult.key !== encryptionKey) {
           grantEncryptionKey = grantResult.key;
           wrappedKeyToUse = await wrapKeyWithToken(refreshToken, grantEncryptionKey);
@@ -2114,19 +2141,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
 
-      // Re-encrypt the access token props if they're different from grant props
       if (accessTokenProps !== grantProps) {
         const tokenResult = await encryptProps(accessTokenProps);
         encryptedAccessTokenProps = tokenResult.encryptedData;
         accessTokenEncryptionKey = tokenResult.key;
       } else {
-        // If they're the same, use the grant's encrypted data and key
         encryptedAccessTokenProps = grantData.encryptedProps;
         accessTokenEncryptionKey = grantEncryptionKey;
       }
     }
 
-    // Calculate the access token expiration time (after callback might have updated TTL)
     const now = Math.floor(Date.now() / 1000);
 
     // Clamp access token TTL to not exceed refresh token's remaining lifetime
@@ -2139,7 +2163,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     const accessTokenExpiresAt = now + accessTokenTTL;
 
-    // Wrap the access token key
     const accessTokenWrappedKey = await wrapKeyWithToken(newAccessToken, accessTokenEncryptionKey);
 
     // Generate new refresh token for rotation
@@ -2148,34 +2171,20 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const newRefreshTokenId = await generateTokenId(newRefreshToken);
     const newRefreshTokenWrappedKey = await wrapKeyWithToken(newRefreshToken, grantEncryptionKey);
 
-    // Update the grant with the token rotation information
-    // The token which the client used this time becomes the "previous" token, so that the client
-    // can always use the same token again next time. This might technically violate OAuth 2.1's
-    // requirement that refresh tokens be single-use. However, this requirement violates the laws
-    // of distributed systems. It's important that the client can always retry when a transient
-    // failure occurs. Under the strict requirement, if the failure occurred after the server
-    // rotated the token but before the client managed to store the updated token, then the client
-    // no longer has any valid refresh token and has effectively lost its grant. That's bad! So
-    // instead, we don't invalidate the old token until the client successfully uses a newer token.
-    // This provides most of the security benefits (tokens still rotate naturally) but without
-    // being inherently unreliable.
+    // Token rotation (see original for rationale on keeping previous token valid)
     grantData.previousRefreshTokenId = providedTokenHash;
     grantData.previousRefreshTokenWrappedKey = wrappedKeyToUse;
-
-    // The newly-generated token becomes the new "current" token.
+    grantData.previousRefreshTokenRotatedAt = Math.floor(Date.now() / 1000);
     grantData.refreshTokenId = newRefreshTokenId;
     grantData.refreshTokenWrappedKey = newRefreshTokenWrappedKey;
 
-    // Save the updated grant with TTL if applicable
-    await this.saveGrantWithTTL(env, grantKey, grantData, now);
+    await this.saveGrantWithTTL(grantKey, grantData, now);
 
     // Parse and validate resource parameter (RFC 8707)
-    // Validate downscoping: token request resources must be subset of grant resources
     if (body.resource && grantData.resource) {
       const requestedResources = Array.isArray(body.resource) ? body.resource : [body.resource];
       const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
-      // Check that all requested resources are in the granted resources
       for (const requested of requestedResources) {
         if (!grantedResources.includes(requested)) {
           return this.createErrorResponse(
@@ -2186,17 +2195,15 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Use resource from token request if provided, otherwise use resource from grant
     const audience = parseResourceParameter(body.resource || grantData.resource);
     if ((body.resource || grantData.resource) && !audience) {
-      // RFC 8707 Section 2.1: invalid or unacceptable resource
       return this.createErrorResponse(
         'invalid_target',
         'The resource parameter must be a valid absolute URI without a fragment'
       );
     }
 
-    // Store new access token with denormalized grant information
+    // Store new access token
     const accessTokenData: Token = {
       id: accessTokenId,
       grantId: grantId,
@@ -2213,12 +2220,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       },
     };
 
-    // Save access token with TTL (using the potentially callback-provided TTL)
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await this.storage.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: accessTokenTTL,
     });
 
-    // Build the response
     const tokenResponse: TokenResponse = {
       access_token: newAccessToken,
       token_type: 'bearer',
@@ -2227,12 +2232,10 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       scope: tokenScopes.join(' '),
     };
 
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
     if (audience) {
       tokenResponse.resource = audience;
     }
 
-    // Return the tokens
     return new Response(JSON.stringify(tokenResponse), {
       headers: { 'Content-Type': 'application/json' },
     });
@@ -2240,18 +2243,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Core token exchange logic (RFC 8693)
-   * Performs the actual token exchange operation
-   * This method is not private because `OAuthHelpers` needs to call it. Note that since
-   * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
-   * module-private.
-   * @param subjectToken - The subject token to exchange
-   * @param requestedScopes - Optional narrowed scopes (must be subset of original)
-   * @param requestedResource - Optional resource/audience (must be subset of original if original had resource)
-   * @param expiresIn - Optional TTL override in seconds
-   * @param clientInfo - The client making the exchange request
-   * @param env - Cloudflare Worker environment variables
-   * @returns Promise resolving to token response
-   * @throws OAuthError with OAuth error code and description
    */
   async exchangeToken(
     subjectToken: string,
@@ -2259,33 +2250,28 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     requestedResource: string | string[] | undefined,
     expiresIn: number | undefined,
     clientInfo: ClientInfo,
-    env: any
+    actorToken?: string,
+    actorTokenType?: string
   ): Promise<TokenResponse & { issued_token_type?: string }> {
-    // Unwrap and validate the subject token
-    const tokenSummary = await this.unwrapToken(subjectToken, env);
+    const tokenSummary = await this.unwrapToken(subjectToken);
     if (!tokenSummary) {
       throw new OAuthError('invalid_grant', 'Invalid or expired subject token');
     }
 
-    // Get the grant to access resource information
     const grantKey = `grant:${tokenSummary.userId}:${tokenSummary.grantId}`;
-    const grantData: Grant | null = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await this.storageGetJson<Grant>(grantKey);
     if (!grantData) {
       throw new OAuthError('invalid_grant', 'Grant not found');
     }
 
-    // If scopes are requested, validate they are a subset of the original grant scopes
     let tokenScopes: string[] = this.downscope(requestedScopes, grantData.scope);
 
-    // Parse and validate resource parameter (RFC 8707) if provided
     let newAudience: string | string[] | undefined = tokenSummary.audience;
     if (requestedResource) {
-      // Validate downscoping: requested resources must be subset of grant resources if grant had resources
       if (grantData.resource) {
         const requestedResources = Array.isArray(requestedResource) ? requestedResource : [requestedResource];
         const grantedResources = Array.isArray(grantData.resource) ? grantData.resource : [grantData.resource];
 
-        // Check that all requested resources are in the granted resources
         for (const requested of requestedResources) {
           if (!grantedResources.includes(requested)) {
             throw new OAuthError('invalid_target', 'Requested resource was not included in the authorization request');
@@ -2293,7 +2279,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
 
-      // Parse and validate the resource parameter
       const parsedResource = parseResourceParameter(requestedResource);
       if (!parsedResource) {
         throw new OAuthError(
@@ -2304,40 +2289,52 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       newAudience = parsedResource;
     }
 
-    // Determine TTL for new token
     const now = Math.floor(Date.now() / 1000);
     const subjectTokenRemainingLifetime = tokenSummary.expiresAt - now;
     let accessTokenTTL = this.options.accessTokenTTL ?? DEFAULT_ACCESS_TOKEN_TTL;
 
-    // If expiresIn is provided, use it but clamp to subject token's remaining lifetime
     if (expiresIn !== undefined) {
       if (expiresIn <= 0) {
         throw new OAuthError('invalid_request', 'Invalid expires_in parameter');
       }
       accessTokenTTL = Math.min(expiresIn, subjectTokenRemainingLifetime);
     } else {
-      // Default to subject token's remaining lifetime or configured TTL, whichever is smaller
       accessTokenTTL = Math.min(accessTokenTTL, subjectTokenRemainingLifetime);
     }
 
-    // Get the subject token data to access encryption key
-    const subjectTokenData: Token | null = await env.OAUTH_KV.get(
-      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`,
-      { type: 'json' }
+    const subjectTokenData = await this.storageGetJson<Token>(
+      `token:${tokenSummary.userId}:${tokenSummary.grantId}:${tokenSummary.id}`
     );
 
     if (!subjectTokenData) {
       throw new OAuthError('invalid_grant', 'Subject token data not found');
     }
 
-    // Unwrap the encryption key from the subject token
     const encryptionKey = await unwrapKeyWithToken(subjectToken, subjectTokenData.wrappedEncryptionKey);
 
-    // Use the same props as the subject token
     let accessTokenEncryptionKey = encryptionKey;
     let encryptedAccessTokenProps = subjectTokenData.grant.encryptedProps;
 
-    // Process token exchange callback if provided
+    // Resolve actor token if provided
+    let actorTokenInfo: TokenSummary | undefined;
+    if (actorToken) {
+      const unwrapped = await this.unwrapToken(actorToken);
+      if (unwrapped) {
+        actorTokenInfo = unwrapped;
+      }
+
+      // Validate may_act claim on subject token if actor token is resolved
+      if (actorTokenInfo) {
+        const subjectDecrypted = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
+        if (subjectDecrypted?.may_act?.sub && subjectDecrypted.may_act.sub !== actorTokenInfo.userId) {
+          throw new OAuthError(
+            'invalid_grant',
+            'Actor is not authorized to act on behalf of the subject (may_act constraint)'
+          );
+        }
+      }
+    }
+
     if (this.options.tokenExchangeCallback) {
       const decryptedProps = await decryptProps(encryptionKey, subjectTokenData.grant.encryptedProps);
 
@@ -2348,6 +2345,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         scope: tokenSummary.grant.scope,
         requestedScope: tokenScopes,
         props: decryptedProps,
+        actorToken,
+        actorTokenType,
+        actorTokenInfo,
       };
 
       const callbackResult = await Promise.resolve(this.options.tokenExchangeCallback(callbackOptions));
@@ -2356,7 +2356,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         let accessTokenProps = decryptedProps;
 
         if (callbackResult.newProps) {
-          // If accessTokenProps wasn't explicitly specified, use the updated newProps
           if (!callbackResult.accessTokenProps) {
             accessTokenProps = callbackResult.newProps;
           }
@@ -2367,25 +2366,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
 
         if (callbackResult.accessTokenTTL !== undefined) {
-          // Clamp to subject token's remaining lifetime
           accessTokenTTL = Math.min(callbackResult.accessTokenTTL, subjectTokenRemainingLifetime);
         }
 
-        // Re-encrypt the access token props if they changed
         if (accessTokenProps !== decryptedProps) {
           const tokenResult = await encryptProps(accessTokenProps);
           encryptedAccessTokenProps = tokenResult.encryptedData;
           accessTokenEncryptionKey = tokenResult.key;
         }
 
-        // If accessTokenScope was specified, use it for this token
         if (callbackResult.accessTokenScope) {
           tokenScopes = this.downscope(callbackResult.accessTokenScope, grantData.scope);
         }
       }
     }
 
-    // Create and store access token
     const newAccessToken = await this.createAccessToken({
       userId: tokenSummary.userId,
       grantId: tokenSummary.grantId,
@@ -2395,10 +2390,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       encryptionKey: accessTokenEncryptionKey,
       expiresIn: accessTokenTTL,
       audience: newAudience,
-      env,
     });
 
-    // Build the response per RFC 8693
     const tokenResponse: TokenResponse & { issued_token_type?: string } = {
       access_token: newAccessToken,
       issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
@@ -2407,7 +2400,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       scope: tokenScopes.join(' '),
     };
 
-    // RFC 8707 Section 2.2: SHOULD return resource parameter in response
     if (newAudience) {
       tokenResponse.resource = newAudience;
     }
@@ -2417,20 +2409,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Handles OAuth 2.0 token exchange requests (RFC 8693)
-   * Exchanges an existing access token for a new one with modified characteristics
-   * @param body - The parsed request body
-   * @param clientInfo - The authenticated client information
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response with new token data or error
    */
-  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo, env: any): Promise<Response> {
+  private async handleTokenExchangeGrant(body: any, clientInfo: ClientInfo): Promise<Response> {
     const subjectToken = body.subject_token;
     const subjectTokenType = body.subject_token_type;
     const requestedTokenType = body.requested_token_type || 'urn:ietf:params:oauth:token-type:access_token';
     const requestedScope = body.scope;
     const requestedResource = body.resource;
+    const actorToken = body.actor_token;
+    const actorTokenType = body.actor_token_type;
 
-    // Validate required parameters
     if (!subjectToken) {
       return this.createErrorResponse('invalid_request', 'subject_token is required');
     }
@@ -2439,17 +2427,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', 'subject_token_type is required');
     }
 
-    // Only support access token as subject token type
     if (subjectTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
       return this.createErrorResponse('invalid_request', 'Only access_token subject_token_type is supported');
     }
 
-    // Only support access token as requested token type
     if (requestedTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
       return this.createErrorResponse('invalid_request', 'Only access_token requested_token_type is supported');
     }
 
-    // Parse requested scopes
+    // actor_token_type is required when actor_token is present (RFC 8693 Section 2.1)
+    if (actorToken && !actorTokenType) {
+      return this.createErrorResponse('invalid_request', 'actor_token_type is required when actor_token is present');
+    }
+
+    if (actorTokenType && actorTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
+      return this.createErrorResponse('invalid_request', 'Only access_token actor_token_type is supported');
+    }
+
     let requestedScopes: string[] | undefined;
     if (requestedScope) {
       if (typeof requestedScope === 'string') {
@@ -2461,7 +2455,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       }
     }
 
-    // Parse expires_in
     let expiresIn: number | undefined;
     if (body.expires_in !== undefined) {
       const requestedTTL = parseInt(body.expires_in, 10);
@@ -2471,7 +2464,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       expiresIn = requestedTTL;
     }
 
-    // Perform the token exchange
     try {
       const tokenResponse = await this.exchangeToken(
         subjectToken,
@@ -2479,42 +2471,29 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         requestedResource,
         expiresIn,
         clientInfo,
-        env
+        actorToken,
+        actorTokenType
       );
 
-      // Return the token
       return new Response(JSON.stringify(tokenResponse), {
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
-      // Convert OAuthError to HTTP error response
       if (error instanceof OAuthError) {
         return this.createErrorResponse(error.code, error.message);
       }
-      // Re-throw unexpected errors
       throw error;
     }
   }
 
   /**
    * Handles OAuth 2.0 token revocation requests (RFC 7009)
-   * @param body - The parsed request body containing revocation parameters
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response confirming revocation or error
    */
-  private async handleRevocationRequest(body: any, env: any): Promise<Response> {
-    // Handle the revocation request
-    return this.revokeToken(body, env);
+  private async handleRevocationRequest(body: any): Promise<Response> {
+    return this.revokeToken(body);
   }
 
-  /**
-   * - Access tokens: Revokes only the specific token
-   * - Refresh tokens: Revokes the entire grant (access + refresh tokens)
-   * @param body - The parsed request body containing token parameter
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response confirming revocation or error
-   */
-  private async revokeToken(body: any, env: any): Promise<Response> {
+  private async revokeToken(body: any): Promise<Response> {
     const token = body.token;
 
     if (!token) {
@@ -2528,99 +2507,66 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const [userId, grantId, _] = tokenParts;
     const tokenId = await generateTokenId(token);
 
-    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId, env);
-    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId, env);
+    const isAccessToken = await this.validateAccessToken(tokenId, userId, grantId);
+    const isRefreshToken = await this.validateRefreshToken(tokenId, userId, grantId);
 
     if (isAccessToken) {
-      await this.revokeSpecificAccessToken(tokenId, userId, grantId, env);
+      await this.revokeSpecificAccessToken(tokenId, userId, grantId);
     } else if (isRefreshToken) {
-      await this.createOAuthHelpers(env).revokeGrant(grantId, userId);
+      await this.createOAuthHelpers().revokeGrant(grantId, userId);
     }
     return new Response('', { status: 200 });
   }
 
-  /**
-   * Revokes a specific access token without affecting the refresh token
-   * @param tokenId - The hashed token ID
-   * @param userId - The user ID extracted from the token
-   * @param grantId - The grant ID extracted from the token
-   * @param env - Cloudflare Worker environment variables
-   */
-  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<void> {
+  private async revokeSpecificAccessToken(tokenId: string, userId: string, grantId: string): Promise<void> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    await env.OAUTH_KV.delete(tokenKey);
+    await this.storage.delete(tokenKey);
   }
 
-  /**
-   * Validates if a token is a valid access token
-   * @param tokenId - The hashed token ID
-   * @param userId - The user ID extracted from the token
-   * @param grantId - The grant ID extracted from the token
-   * @param env - Cloudflare Worker environment variables
-   * @returns Promise<boolean> indicating if the token is valid
-   */
-  private async validateAccessToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateAccessToken(tokenId: string, userId: string, grantId: string): Promise<boolean> {
     const tokenKey = `token:${userId}:${grantId}:${tokenId}`;
-    const tokenData = await env.OAUTH_KV.get(tokenKey, { type: 'json' });
+    const tokenData = await this.storageGetJson<Token>(tokenKey);
 
     if (!tokenData) {
       return false;
     }
 
-    // Check if token is expired
     const now = Math.floor(Date.now() / 1000);
     return tokenData.expiresAt >= now;
   }
 
-  /**
-   * Validates if a token is a valid refresh token
-   * @param tokenId - The hashed token ID
-   * @param userId - The user ID extracted from the token
-   * @param grantId - The grant ID extracted from the token
-   * @param env - Cloudflare Worker environment variables
-   * @returns Promise<boolean> indicating if the token is valid
-   */
-  private async validateRefreshToken(tokenId: string, userId: string, grantId: string, env: any): Promise<boolean> {
+  private async validateRefreshToken(tokenId: string, userId: string, grantId: string): Promise<boolean> {
     const grantKey = `grant:${userId}:${grantId}`;
-    const grantData = await env.OAUTH_KV.get(grantKey, { type: 'json' });
+    const grantData = await this.storageGetJson<Grant>(grantKey);
 
     if (!grantData) {
       return false;
     }
 
-    // Check if this matches the current or previous refresh token
     return grantData.refreshTokenId === tokenId || grantData.previousRefreshTokenId === tokenId;
   }
 
   /**
    * Handles the dynamic client registration endpoint (RFC 7591)
-   * @param request - The HTTP request
-   * @param env - Cloudflare Worker environment variables
-   * @returns Response with client registration data or error
    */
-  private async handleClientRegistration(request: Request, env: any): Promise<Response> {
+  private async handleClientRegistration(request: Request): Promise<Response> {
     if (!this.options.clientRegistrationEndpoint) {
       return this.createErrorResponse('not_implemented', 'Client registration is not enabled', 501);
     }
 
-    // Check method
     if (request.method !== 'POST') {
       return this.createErrorResponse('invalid_request', 'Method not allowed', 405);
     }
 
-    // Check content length to ensure it's not too large (1 MiB limit)
     const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
     if (contentLength > 1048576) {
-      // 1 MiB = 1048576 bytes
       return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
     }
 
-    // Parse client metadata with a size limitation
     let clientMetadata;
     try {
       const text = await request.text();
       if (text.length > 1048576) {
-        // Double-check text length
         return this.createErrorResponse('invalid_request', 'Request payload too large, must be under 1 MiB', 413);
       }
       clientMetadata = JSON.parse(text);
@@ -2628,20 +2574,16 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       return this.createErrorResponse('invalid_request', 'Invalid JSON payload', 400);
     }
 
-    // Get token endpoint auth method, default to client_secret_basic
     const authMethod =
       OAuthProviderImpl.validateStringField(clientMetadata.token_endpoint_auth_method) || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
-    // Check if public client registrations are disallowed
     if (isPublicClient && this.options.disallowPublicClientRegistration) {
       return this.createErrorResponse('invalid_client_metadata', 'Public client registration is not allowed');
     }
 
-    // Create client ID
     const clientId = generateRandomString(16);
 
-    // Only create client secret for confidential clients
     let clientSecret: string | undefined;
     let hashedSecret: string | undefined;
 
@@ -2652,13 +2594,11 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
     let clientInfo: ClientInfo;
     try {
-      // Validate redirect URIs - must exist and have at least one entry
       const redirectUris = OAuthProviderImpl.validateStringArray(clientMetadata.redirect_uris);
       if (!redirectUris || redirectUris.length === 0) {
         throw new Error('At least one redirect URI is required');
       }
 
-      // Validate each redirect URI scheme
       for (const uri of redirectUris) {
         validateRedirectUriScheme(uri);
       }
@@ -2683,7 +2623,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         tokenEndpointAuthMethod: authMethod,
       };
 
-      // Add client secret only for confidential clients
       if (!isPublicClient && hashedSecret) {
         clientInfo.clientSecret = hashedSecret;
       }
@@ -2694,10 +2633,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       );
     }
 
-    // Store client info
-    await env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(clientInfo));
+    await this.storage.put(`client:${clientId}`, JSON.stringify(clientInfo));
 
-    // Return client information with the original unhashed secret
     const response: Record<string, any> = {
       client_id: clientInfo.clientId,
       redirect_uris: clientInfo.redirectUris,
@@ -2715,10 +2652,9 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       client_id_issued_at: clientInfo.registrationDate,
     };
 
-    // Only include client_secret for confidential clients (RFC 7591 §3.2.1)
     if (clientSecret) {
-      response.client_secret = clientSecret; // Return the original unhashed secret
-      response.client_secret_expires_at = 0; // Secret does not expire
+      response.client_secret = clientSecret;
+      response.client_secret_expires_at = 0;
       response.client_secret_issued_at = clientInfo.registrationDate;
     }
 
@@ -2730,12 +2666,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Handles API requests by validating the access token and calling the API handler
-   * @param request - The HTTP request
-   * @param env - Cloudflare Worker environment variables
-   * @param ctx - Cloudflare Worker execution context
-   * @returns Response from the API handler or error
    */
-  private async handleApiRequest(request: Request, env: any, ctx: ExecutionContext): Promise<Response> {
+  private async handleApiRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource`;
 
@@ -2760,23 +2692,21 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     let userId = '';
     let grantId = '';
 
-    // It's a token generated by workers-oauth-provider
     if (isPossiblyInternalFormat) {
       [userId, grantId] = parts;
       const id = await generateTokenId(accessToken);
-      tokenData = await env.OAUTH_KV.get(`token:${userId}:${grantId}:${id}`, { type: 'json' });
+      tokenData = await this.storageGetJson<Token>(`token:${userId}:${grantId}:${id}`);
     }
 
-    // No internal token found in KV and no external token validator provided
     if (!tokenData && !this.options.resolveExternalToken) {
       return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
         'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
       });
     }
 
-    // Internal token data was found in KV, so we check for expiration and set the context props
+    let props: any = undefined;
+
     if (tokenData) {
-      // Check if token is expired (should be auto-deleted by KV TTL, but double-check)
       const now = Math.floor(Date.now() / 1000);
       if (tokenData.expiresAt < now) {
         return this.createErrorResponse('invalid_token', 'Access token expired', 401, {
@@ -2784,15 +2714,12 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         });
       }
 
-      // Validate audience according to RFC 7519 Section 4.1.3
-      // "If the principal processing the claim does not identify itself with a value in the
-      // 'aud' claim when this claim is present, then the JWT MUST be rejected."
+      // Validate audience
       if (tokenData.audience) {
         const requestUrl = new URL(request.url);
         const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(tokenData.audience) ? tokenData.audience : [tokenData.audience];
 
-        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
           return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
@@ -2805,32 +2732,23 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
 
-      // Unwrap the encryption key using the access token
       const encryptionKey = await unwrapKeyWithToken(accessToken, tokenData.wrappedEncryptionKey);
-
-      // Decrypt the props
-      const decryptedProps = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
-
-      // Set the decrypted props on the context object
-      (ctx as MutableExecutionContext).props = decryptedProps;
+      props = await decryptProps(encryptionKey, tokenData.grant.encryptedProps);
     } else if (this.options.resolveExternalToken) {
-      // No token data was found, so we validate the provided token with the provided validator
-      const ext = await this.options.resolveExternalToken({ token: accessToken, request, env });
+      const ext = await this.options.resolveExternalToken({ token: accessToken, request });
 
-      // Failed external validation
       if (!ext) {
         return this.createErrorResponse('invalid_token', 'Invalid access token', 401, {
           'WWW-Authenticate': this.buildWwwAuthenticateHeader(resourceMetadataUrl, 'invalid_token'),
         });
       }
 
-      // Validate that tokens were issued specifically for them
+      // Validate audience for external token
       if (ext.audience) {
         const requestUrl = new URL(request.url);
         const resourceServer = `${requestUrl.protocol}//${requestUrl.host}${requestUrl.pathname}`;
         const audiences = Array.isArray(ext.audience) ? ext.audience : [ext.audience];
 
-        // Check if any audience matches (RFC 3986: case-insensitive hostname comparison)
         const matches = audiences.some((aud) => audienceMatches(resourceServer, aud));
         if (!matches) {
           return this.createErrorResponse('invalid_token', 'Token audience does not match resource server', 401, {
@@ -2843,105 +2761,98 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         }
       }
 
-      // Set the external props on the context object
-      (ctx as MutableExecutionContext).props = ext.props;
-    }
-
-    // Inject OAuth helpers into env if not already present
-    if (!(env as Record<string, unknown>).OAUTH_PROVIDER) {
-      (env as Record<string, unknown>).OAUTH_PROVIDER = this.createOAuthHelpers(env);
+      props = ext.props;
     }
 
     // Find the appropriate API handler for this URL
     const apiHandler = this.findApiHandlerForUrl(url);
 
     if (!apiHandler) {
-      // This shouldn't happen since we already checked with isApiRequest,
-      // but handle it gracefully just in case
       return this.createErrorResponse('invalid_request', 'No handler found for API route', 404);
     }
 
-    // Call the API handler based on its type
-    if (apiHandler.type === HandlerType.EXPORTED_HANDLER) {
-      // It's an object with a fetch method
-      return apiHandler.handler.fetch(request as Parameters<ExportedHandlerWithFetch['fetch']>[0], env, ctx);
-    } else {
-      // It's a WorkerEntrypoint class - instantiate it with ctx and env in that order
-      const handler = new apiHandler.handler(ctx, env);
-      return handler.fetch(request);
-    }
+    // Call the API handler with props context
+    return apiHandler.fetch(request, { props });
   }
+
   /**
    * Creates the helper methods object for OAuth operations
-   * This is passed to the handler functions to allow them to interact with the OAuth system
-   * @param env - Cloudflare Worker environment variables
-   * @returns An instance of OAuthHelpers
    */
-  public createOAuthHelpers(env: any): OAuthHelpers {
-    return new OAuthHelpersImpl(env, this);
+  public createOAuthHelpers(): OAuthHelpersImpl {
+    return new OAuthHelpersImpl(this);
   }
 
   /**
-   * Saves a grant to KV with appropriate TTL based on expiration
-   * @param env - The environment bindings
-   * @param grantKey - The KV key for the grant
-   * @param grantData - The grant data to save
-   * @param now - Current timestamp in seconds
+   * Saves a grant to storage with appropriate TTL based on expiration
    */
-  private async saveGrantWithTTL(env: any, grantKey: string, grantData: Grant, now: number): Promise<void> {
-    // Use absolute expiration timestamp if grant has an expiration
-    const kvOptions = grantData.expiresAt !== undefined ? { expiration: grantData.expiresAt } : {};
-    await env.OAUTH_KV.put(grantKey, JSON.stringify(grantData), kvOptions);
+  private async saveGrantWithTTL(grantKey: string, grantData: Grant, now: number): Promise<void> {
+    const options =
+      grantData.expiresAt !== undefined ? { expirationTtl: Math.max(1, grantData.expiresAt - now) } : undefined;
+    await this.storage.put(grantKey, JSON.stringify(grantData), options);
   }
 
   /**
-   * Fetches client information from KV storage or via CIMD (Client ID Metadata Document)
-   * This method is not private because `OAuthHelpers` needs to call it. Note that since
-   * `OAuthProviderImpl` is not exposed outside this module, this is still effectively
-   * module-private.
-   *
-   * Supports CIMD: If clientId is an HTTPS URL with a non-root path, the metadata
-   * document will be fetched from that URL instead of looking up in KV storage.
-   *
-   * @param env - Cloudflare Worker environment variables
-   * @param clientId - The client ID to look up (can be a regular ID or an HTTPS URL for CIMD)
-   * @returns The client information, or null if not found
+   * Fetches client information from storage or via CIMD (Client ID Metadata Document)
    */
-  async getClient(env: any, clientId: string): Promise<ClientInfo | null> {
+  async getClient(clientId: string): Promise<ClientInfo | null> {
     // Check if this is a CIMD (Client ID Metadata Document) URL
     if (this.isClientMetadataUrl(clientId)) {
       if (!this.options.clientIdMetadataDocumentEnabled) {
-        // CIMD not enabled — treat as standard KV lookup
         const clientKey = `client:${clientId}`;
-        return env.OAUTH_KV.get(clientKey, { type: 'json' });
+        return this.storageGetJson<ClientInfo>(clientKey);
       }
-      if (!this.hasGlobalFetchStrictlyPublic()) {
-        throw new Error(`CIMD is enabled but 'global_fetch_strictly_public' compatibility flag is not set.`);
+
+      const cimdCacheTtl = this.options.cimdCacheTtl ?? 0;
+
+      // Check cache first
+      if (cimdCacheTtl > 0) {
+        const cacheKey = `cimd_cache:${clientId}`;
+        const cached = await this.storageGetJson<{ clientInfo: ClientInfo; expiresAt: number }>(cacheKey);
+        if (cached && cached.expiresAt > Math.floor(Date.now() / 1000)) {
+          return cached.clientInfo;
+        }
       }
+
       try {
-        return await this.fetchClientMetadataDocument(clientId);
+        const clientInfo = await this.fetchClientMetadataDocument(clientId);
+
+        // Store in cache (storage TTL is 2x cache TTL to allow stale-while-revalidate)
+        if (cimdCacheTtl > 0) {
+          const cacheEntry = {
+            clientInfo,
+            expiresAt: Math.floor(Date.now() / 1000) + cimdCacheTtl,
+          };
+          await this.storage.put(`cimd_cache:${clientId}`, JSON.stringify(cacheEntry), {
+            expirationTtl: cimdCacheTtl * 2,
+          });
+        }
+
+        return clientInfo;
       } catch (error) {
-        // CIMD fetch failed (size limit, timeout, HTTP error, invalid metadata, etc.)
-        // Return null so callers treat this as "client not found" instead of a 500
         console.warn(`CIMD fetch failed for ${clientId}:`, error instanceof Error ? error.message : error);
+
+        // Serve stale cache on fetch failure
+        if (cimdCacheTtl > 0) {
+          const cacheKey = `cimd_cache:${clientId}`;
+          const stale = await this.storageGetJson<{ clientInfo: ClientInfo }>(cacheKey);
+          if (stale) return stale.clientInfo;
+        }
+
         return null;
       }
     }
 
-    // Standard KV lookup
+    // Standard storage lookup
     const clientKey = `client:${clientId}`;
-    return env.OAUTH_KV.get(clientKey, { type: 'json' });
+    return this.storageGetJson<ClientInfo>(clientKey);
   }
 
   /**
    * Creates and stores an access token
-   * @param params - Options for creating the access token
-   * @returns The access token string
    */
   private async createAccessToken(params: CreateAccessTokenOptions): Promise<string> {
-    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience, env } = params;
+    const { userId, grantId, clientId, scope, encryptedProps, encryptionKey, expiresIn, audience } = params;
 
-    // Generate access token
     const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
     const accessToken = `${userId}:${grantId}:${accessTokenSecret}`;
 
@@ -2949,10 +2860,8 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const accessTokenId = await generateTokenId(accessToken);
     const accessTokenExpiresAt = now + expiresIn;
 
-    // Wrap the key for the access token
     const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
-    // Store access token with denormalized grant information
     const accessTokenData: Token = {
       id: accessTokenId,
       grantId: grantId,
@@ -2969,8 +2878,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       },
     };
 
-    // Save access token with TTL
-    await env.OAUTH_KV.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+    await this.storage.put(`token:${userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
       expirationTtl: expiresIn,
     });
 
@@ -2979,10 +2887,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Downscopes requested scopes to only include those that are in the grant
-   * Filters out any requested scopes that are not in the granted scopes
-   * @param requestedScope - The scope parameter from the request (string or array)
-   * @param grantedScopes - The scopes that were granted in the authorization
-   * @returns The filtered scopes that are a subset of the granted scopes
    */
   private downscope(requestedScope: string | string[] | undefined, grantedScopes: string[]): string[] {
     if (!requestedScope) return grantedScopes;
@@ -2990,19 +2894,7 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     const requestedScopes: string[] =
       typeof requestedScope === 'string' ? requestedScope.split(' ').filter(Boolean) : requestedScope;
 
-    // Filter out any requested scopes that are not in the grant
     return requestedScopes.filter((scope: string) => grantedScopes.includes(scope));
-  }
-
-  /**
-   * Checks if the global_fetch_strictly_public compatibility flag is enabled.
-   * This flag is required for CIMD to prevent SSRF attacks.
-   * See: https://developers.cloudflare.com/workers/configuration/compatibility-flags/#global-fetch-strictly-public
-   */
-  private hasGlobalFetchStrictlyPublic(): boolean {
-    const compatFlags =
-      typeof Cloudflare !== 'undefined' && Cloudflare.compatibilityFlags ? Cloudflare.compatibilityFlags : null;
-    return !!compatFlags?.global_fetch_strictly_public;
   }
 
   /**
@@ -3024,23 +2916,14 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Request timeout for CIMD metadata fetches (10 seconds)
-   * Prevents slow-loris style attacks
    */
   private static readonly CIMD_FETCH_TIMEOUT_MS = 10_000;
 
   /**
    * Allowed authentication methods for CIMD clients (per IETF spec)
-   * CIMD clients cannot use symmetric secrets since there's no pre-shared secret
    */
   private static readonly CIMD_ALLOWED_AUTH_METHODS = ['none', 'private_key_jwt'];
 
-  /**
-   * Validates that a field is a string or undefined
-   * @param field - The field value to validate
-   * @param fieldName - Name of the field for error messages
-   * @returns The validated string or undefined
-   * @throws Error if field is not a string or undefined
-   */
   private static validateStringField(field: unknown, fieldName?: string): string | undefined {
     if (field === undefined) return undefined;
     if (typeof field !== 'string') {
@@ -3051,13 +2934,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     return field;
   }
 
-  /**
-   * Validates that a field is a string array or undefined
-   * @param arr - The array to validate
-   * @param fieldName - Name of the field for error messages
-   * @returns The validated string array or undefined
-   * @throws Error if field is not a string array or undefined
-   */
   private static validateStringArray(arr: unknown, fieldName?: string): string[] | undefined {
     if (arr === undefined) return undefined;
     if (!Array.isArray(arr)) {
@@ -3073,14 +2949,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Fetches and validates a Client ID Metadata Document from the given URL
-   * Per the MCP spec, the client_id in the document must match the URL exactly
-   *
-   * Uses Cloudflare HTTP cache for caching (via cacheEverything option).
-   * Response size is limited to 5KB per IETF spec.
-   *
-   * @param metadataUrl - The HTTPS URL to fetch metadata from
-   * @returns The client information
-   * @throws Error if fetch fails or validation fails
    */
   private async fetchClientMetadataDocument(metadataUrl: string): Promise<ClientInfo> {
     const abortController = new AbortController();
@@ -3090,7 +2958,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
       const response = await fetch(metadataUrl, {
         headers: { Accept: 'application/json' },
         signal: abortController.signal,
-        cf: { cacheEverything: true },
       });
 
       clearTimeout(timeoutId);
@@ -3115,7 +2982,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
         'token_endpoint_auth_method'
       );
 
-      // Validate that client_id matches the URL (required by spec)
       if (clientId !== metadataUrl) {
         throw new Error(`client_id "${clientId}" does not match metadata URL "${metadataUrl}"`);
       }
@@ -3154,12 +3020,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Reads JSON from a response with a size limit to prevent DoS attacks.
-   * Streams the response body and aborts if it exceeds the limit.
-   *
-   * @param response - The fetch response
-   * @param maxBytes - Maximum allowed size in bytes
-   * @returns Parsed JSON object
-   * @throws Error if response body is null, size exceeded, or JSON parse failed
    */
   private async readJsonWithSizeLimit(response: Response, maxBytes: number): Promise<Record<string, unknown>> {
     const reader = response.body?.getReader();
@@ -3213,11 +3073,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 
   /**
    * Helper function to create OAuth error responses
-   * @param code - OAuth error code (e.g., 'invalid_request', 'invalid_token')
-   * @param description - Human-readable error description
-   * @param status - HTTP status code (default: 400)
-   * @param headers - Additional headers to include
-   * @returns A Response object with the error
    */
   private createErrorResponse(
     code: string,
@@ -3225,7 +3080,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
     status: number = 400,
     headers: Record<string, string> = {}
   ): Response {
-    // Notify the user of the error and allow them to override the response
     const customErrorResponse = this.options.onError?.({ code, description, status, headers });
     if (customErrorResponse) return customErrorResponse;
 
@@ -3245,10 +3099,6 @@ class OAuthProviderImpl<Env = Cloudflare.Env> {
 }
 
 // Constants
-/**
- * Error class for OAuth operations
- * Carries OAuth error code and description for proper error responses
- */
 class OAuthError extends Error {
   constructor(
     public code: string,
@@ -3259,22 +3109,12 @@ class OAuthError extends Error {
   }
 }
 
-/**
- * Default expiration time for access tokens (1 hour in seconds)
- */
 const DEFAULT_ACCESS_TOKEN_TTL = 60 * 60;
 
-/**
- * Length of generated token strings
- */
 const TOKEN_LENGTH = 32;
 
 // Helper Functions
-/**
- * Validates a resource URI per RFC 8707 Section 2
- * @param uri - The URI string to validate
- * @returns true if valid, false otherwise
- */
+
 function validateResourceUri(uri: string): boolean {
   if (!uri || typeof uri !== 'string') {
     return false;
@@ -3283,76 +3123,51 @@ function validateResourceUri(uri: string): boolean {
   try {
     const parsed = new URL(uri);
 
-    // RFC 8707: MUST be absolute URI (has protocol)
     if (!parsed.protocol) {
       return false;
     }
 
-    // RFC 8707: MUST NOT include a fragment component
     if (parsed.hash) {
       return false;
     }
 
-    // Must be http or https for security
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       return false;
     }
 
     return true;
   } catch {
-    // Invalid URI format
     return false;
   }
 }
 
-/**
- * Checks if a resource server matches an audience claim.
- * Uses origin comparison (case-insensitive hostname via URL normalization)
- * and path-prefix matching on path boundaries for RFC 8707 resource indicators.
- * @param resourceServerUrl - The resource server URL (from request)
- * @param audienceValue - The audience value from token
- * @returns true if they match, false otherwise
- */
 function audienceMatches(resourceServerUrl: string, audienceValue: string): boolean {
   try {
     const resource = new URL(resourceServerUrl);
     const audience = new URL(audienceValue);
 
-    // Origins must always match (case-insensitive via URL normalization)
     if (resource.origin !== audience.origin) {
       return false;
     }
 
-    // Origin-only audience matches any path (backward compatibility)
     if (audience.pathname === '/' || audience.pathname === '') {
       return true;
     }
 
-    // Path-aware audience: prefix match on path boundary (RFC 8707)
-    // e.g. audience "/api" matches request "/api", "/api/", "/api/users"
-    // but does NOT match "/api-v2" or "/apiary"
     return resource.pathname === audience.pathname || resource.pathname.startsWith(audience.pathname + '/');
   } catch {
     return false;
   }
 }
 
-/**
- * Parses and validates the resource parameter from a token request (RFC 8707)
- * Handles single string or array of strings (from multiple form parameters)
- * @param value - The resource parameter value from the request body
- * @returns The validated value as string, string array, or undefined if validation fails
- */
 function parseResourceParameter(value: string | string[] | undefined): string | string[] | undefined {
   if (!value) {
     return undefined;
   }
 
-  // Validate all URIs (RFC 8707 Section 2)
   const uris = Array.isArray(value) ? value : [value];
   for (const uri of uris) {
     if (typeof uri !== 'string' || !validateResourceUri(uri)) {
-      // Invalid resource URI - return undefined to trigger error
       return undefined;
     }
   }
@@ -3360,21 +3175,10 @@ function parseResourceParameter(value: string | string[] | undefined): string | 
   return value;
 }
 
-/**
- * Hashes a secret value using SHA-256
- * @param secret - The secret value to hash
- * @returns A hex string representation of the hash
- */
 async function hashSecret(secret: string): Promise<string> {
-  // Use the same approach as generateTokenId for consistency
   return generateTokenId(secret);
 }
 
-/**
- * Generates a cryptographically secure random string
- * @param length - The length of the string to generate
- * @returns A random string of the specified length
- */
 function generateRandomString(length: number): string {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   let result = '';
@@ -3386,45 +3190,23 @@ function generateRandomString(length: number): string {
   return result;
 }
 
-/**
- * Generates a token ID by hashing the token value using SHA-256
- * @param token - The token to hash
- * @returns A hex string representation of the hash
- */
 async function generateTokenId(token: string): Promise<string> {
-  // Convert the token string to a Uint8Array
   const encoder = new TextEncoder();
   const data = encoder.encode(token);
 
-  // Use the WebCrypto API to create a SHA-256 hash
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
 
-  // Convert the hash to a hex string
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 
   return hashHex;
 }
 
-/**
- * Validates that a redirect URI does not use a dangerous pseudo-scheme.
- * Normalizes the URI by trimming whitespace and checking the scheme in a
- * case-insensitive manner to prevent bypass attacks.
- * Per RFC 3986, control characters are explicitly disallowed in URIs and
- * will cause rejection rather than silent removal.
- * @param redirectUri - The redirect URI to validate
- * @throws Error if the URI uses a blacklisted scheme or contains control characters
- */
 function validateRedirectUriScheme(redirectUri: string): void {
-  // List of dangerous pseudo-schemes that should not be allowed
   const dangerousSchemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'mailto:', 'blob:'];
 
-  // 1. Trim leading and trailing whitespace (allowed per RFC 3986 preprocessing)
   const normalized = redirectUri.trim();
 
-  // 2. Reject URIs containing control characters (RFC 3986 compliance)
-  // Control characters (0x00-0x1F, 0x7F-0x9F) are explicitly disallowed in URIs
-  // and their presence indicates a malformed or potentially malicious URI
   for (let i = 0; i < normalized.length; i++) {
     const code = normalized.charCodeAt(i);
     if ((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f)) {
@@ -3432,17 +3214,13 @@ function validateRedirectUriScheme(redirectUri: string): void {
     }
   }
 
-  // 3. Extract the scheme by finding everything before the first ':'
   const colonIndex = normalized.indexOf(':');
   if (colonIndex === -1) {
-    // No scheme present - reject relative URIs
     throw new Error('Invalid redirect URI');
   }
 
-  // Get the scheme and convert to lowercase for case-insensitive comparison
   const scheme = normalized.substring(0, colonIndex + 1).toLowerCase();
 
-  // Check against blacklist
   for (const dangerousScheme of dangerousSchemes) {
     if (scheme === dangerousScheme) {
       throw new Error('Invalid redirect URI');
@@ -3450,20 +3228,13 @@ function validateRedirectUriScheme(redirectUri: string): void {
   }
 }
 
-/**
- * Checks if a URI is a loopback redirect URI (127.0.0.0/8, ::1, or localhost).
- * Per RFC 8252 Section 7.3, loopback IPs get special port handling. This library
- * applies the same port flexibility to localhost for native apps (e.g., Claude Code).
- */
 function isLoopbackUri(uri: string): boolean {
   try {
     const url = new URL(uri);
     const host = url.hostname;
-    // Check for IPv4 loopback (127.0.0.0/8)
     if (host.match(/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) {
       return true;
     }
-    // Check for IPv6 loopback (::1 or [::1])
     if (host === '::1' || host === '[::1]') {
       return true;
     }
@@ -3476,19 +3247,12 @@ function isLoopbackUri(uri: string): boolean {
   }
 }
 
-/**
- * Validates a redirect URI against registered URIs with RFC 8252 loopback support.
- * For loopback URIs (127.x.x.x, ::1, localhost), any port is allowed as long as scheme, host, path, and query match.
- * For non-loopback URIs, exact match is required.
- */
 function isValidRedirectUri(requestUri: string, registeredUris: string[]): boolean {
   return registeredUris.some((registered) => {
-    // For loopback URIs, allow any port (RFC 8252 Section 7.3)
     if (isLoopbackUri(requestUri) && isLoopbackUri(registered)) {
       try {
         const reqUrl = new URL(requestUri);
         const regUrl = new URL(registered);
-        // Must match scheme, hostname, pathname, and query (ignore port only)
         return (
           reqUrl.protocol === regUrl.protocol &&
           reqUrl.hostname === regUrl.hostname &&
@@ -3499,34 +3263,18 @@ function isValidRedirectUri(requestUri: string, registeredUris: string[]): boole
         return false;
       }
     }
-    // Non-loopback: exact match required
     return requestUri === registered;
   });
 }
 
-/**
- * Encodes a string as base64url (URL-safe base64)
- * @param str - The string to encode
- * @returns The base64url encoded string
- */
 function base64UrlEncode(str: string): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
-/**
- * Encodes an ArrayBuffer as base64 string
- * @param buffer - The ArrayBuffer to encode
- * @returns The base64 encoded string
- */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(String.fromCharCode(...new Uint8Array(buffer)));
 }
 
-/**
- * Decodes a base64 string to an ArrayBuffer
- * @param base64 - The base64 string to decode
- * @returns The decoded ArrayBuffer
- */
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const binaryString = atob(base64);
   const bytes = new Uint8Array(binaryString.length);
@@ -3536,32 +3284,23 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-/**
- * Encrypts props data with a newly generated key
- * @param data - The data to encrypt
- * @returns An object containing the encrypted data and the generated key
- */
 async function encryptProps(data: any): Promise<{ encryptedData: string; key: CryptoKey }> {
-  // Generate a new encryption key for this specific props data
   // @ts-ignore
   const key: CryptoKey = await crypto.subtle.generateKey(
     {
       name: 'AES-GCM',
       length: 256,
     },
-    true, // extractable
+    true,
     ['encrypt', 'decrypt']
   );
 
-  // Use a constant IV (all zeros) since each key is used only once
   const iv = new Uint8Array(12);
 
-  // Convert data to string
   const jsonData = JSON.stringify(data);
   const encoder = new TextEncoder();
   const encodedData = encoder.encode(jsonData);
 
-  // Encrypt the data
   const encryptedBuffer = await crypto.subtle.encrypt(
     {
       name: 'AES-GCM',
@@ -3571,27 +3310,17 @@ async function encryptProps(data: any): Promise<{ encryptedData: string; key: Cr
     encodedData
   );
 
-  // Convert to base64 for storage
   return {
     encryptedData: arrayBufferToBase64(encryptedBuffer),
     key,
   };
 }
 
-/**
- * Decrypts encrypted props data using the provided key
- * @param key - The CryptoKey to use for decryption
- * @param encryptedData - The encrypted data as a base64 string
- * @returns The decrypted data object
- */
 async function decryptProps(key: CryptoKey, encryptedData: string): Promise<any> {
-  // Convert base64 string back to ArrayBuffer
   const encryptedBuffer = base64ToArrayBuffer(encryptedData);
 
-  // Use the same constant IV (all zeros) that was used for encryption
   const iv = new Uint8Array(12);
 
-  // Decrypt the data
   const decryptedBuffer = await crypto.subtle.decrypt(
     {
       name: 'AES-GCM',
@@ -3601,31 +3330,19 @@ async function decryptProps(key: CryptoKey, encryptedData: string): Promise<any>
     encryptedBuffer
   );
 
-  // Convert the decrypted buffer to a string, then parse as JSON
   const decoder = new TextDecoder();
   const jsonData = decoder.decode(decryptedBuffer);
   return JSON.parse(jsonData);
 }
 
-// Static HMAC key for wrapping key derivation
-// This ensures that even if someone has the token ID, they can't derive the wrapping key
-// We use a fixed array of 32 bytes for optimal performance
 const WRAPPING_KEY_HMAC_KEY = new Uint8Array([
   0x22, 0x7e, 0x26, 0x86, 0x8d, 0xf1, 0xe1, 0x6d, 0x80, 0x70, 0xea, 0x17, 0x97, 0x5b, 0x47, 0xa6, 0x82, 0x18, 0xfa,
   0x87, 0x28, 0xae, 0xde, 0x85, 0xb5, 0x1d, 0x4a, 0xd9, 0x96, 0xca, 0xca, 0x43,
 ]);
 
-/**
- * Derives a wrapping key from a token string
- * This intentionally uses a different method than token ID generation
- * to ensure the token ID cannot be used to derive the wrapping key
- * @param tokenStr - The token string to use as key material
- * @returns A Promise resolving to the derived CryptoKey
- */
 async function deriveKeyFromToken(tokenStr: string): Promise<CryptoKey> {
   const encoder = new TextEncoder();
 
-  // Import the pre-defined HMAC key (already 32 bytes)
   const hmacKey = await crypto.subtle.importKey(
     'raw',
     WRAPPING_KEY_HMAC_KEY,
@@ -3634,84 +3351,44 @@ async function deriveKeyFromToken(tokenStr: string): Promise<CryptoKey> {
     ['sign']
   );
 
-  // Use HMAC-SHA256 to derive the wrapping key material
   const hmacResult = await crypto.subtle.sign('HMAC', hmacKey, encoder.encode(tokenStr));
 
-  // Import the HMAC result as the wrapping key
-  return await crypto.subtle.importKey(
-    'raw',
-    hmacResult,
-    { name: 'AES-KW' },
-    false, // not extractable
-    ['wrapKey', 'unwrapKey']
-  );
+  return await crypto.subtle.importKey('raw', hmacResult, { name: 'AES-KW' }, false, ['wrapKey', 'unwrapKey']);
 }
 
-/**
- * Wraps an encryption key using a token-derived key
- * @param tokenStr - The token string to use for key wrapping
- * @param keyToWrap - The encryption key to wrap
- * @returns A Promise resolving to the wrapped key as a base64 string
- */
 async function wrapKeyWithToken(tokenStr: string, keyToWrap: CryptoKey): Promise<string> {
-  // Derive a key from the token
   const wrappingKey = await deriveKeyFromToken(tokenStr);
-
-  // Wrap the encryption key
   const wrappedKeyBuffer = await crypto.subtle.wrapKey('raw', keyToWrap, wrappingKey, { name: 'AES-KW' });
-
-  // Convert to base64 for storage
   return arrayBufferToBase64(wrappedKeyBuffer);
 }
 
-/**
- * Unwraps an encryption key using a token-derived key
- * @param tokenStr - The token string used for key wrapping
- * @param wrappedKeyBase64 - The wrapped key as a base64 string
- * @returns A Promise resolving to the unwrapped CryptoKey
- */
 async function unwrapKeyWithToken(tokenStr: string, wrappedKeyBase64: string): Promise<CryptoKey> {
-  // Derive a key from the token
   const wrappingKey = await deriveKeyFromToken(tokenStr);
-
-  // Convert base64 wrapped key to ArrayBuffer
   const wrappedKeyBuffer = base64ToArrayBuffer(wrappedKeyBase64);
 
-  // Unwrap the key
   return await crypto.subtle.unwrapKey(
     'raw',
     wrappedKeyBuffer,
     wrappingKey,
     { name: 'AES-KW' },
     { name: 'AES-GCM' },
-    true, // extractable
+    true,
     ['encrypt', 'decrypt']
   );
 }
 
 /**
  * Class that implements the OAuth helper methods
- * Provides methods for OAuth operations needed by handlers
  */
 class OAuthHelpersImpl implements OAuthHelpers {
-  private env: any;
-  private provider: OAuthProviderImpl<any>;
+  private storage: StorageAdapter;
+  private provider: OAuthProviderImpl;
 
-  /**
-   * Creates a new OAuthHelpers instance
-   * @param env - Cloudflare Worker environment variables
-   * @param provider - Reference to the parent provider instance
-   */
-  constructor(env: any, provider: OAuthProviderImpl<any>) {
-    this.env = env;
+  constructor(provider: OAuthProviderImpl) {
+    this.storage = provider.storage;
     this.provider = provider;
   }
 
-  /**
-   * Parses an OAuth authorization request from the HTTP request
-   * @param request - The HTTP request containing OAuth parameters
-   * @returns The parsed authorization request parameters
-   */
   async parseAuthRequest(request: Request): Promise<AuthRequest> {
     const url = new URL(request.url);
     const responseType = url.searchParams.get('response_type') || '';
@@ -3721,39 +3398,31 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const state = url.searchParams.get('state') || '';
     const codeChallenge = url.searchParams.get('code_challenge') || undefined;
     const codeChallengeMethod = url.searchParams.get('code_challenge_method') || 'plain';
-    // RFC 8707 Section 2.1: Multiple resource parameters MAY be used
     const resourceParams = url.searchParams.getAll('resource');
     const resourceParam =
       resourceParams.length > 0 ? (resourceParams.length === 1 ? resourceParams[0] : resourceParams) : undefined;
 
-    // Validate redirect URI to prevent javascript: URIs / XSS attacks
-    // Using helper function that normalizes and checks in a case-insensitive manner
     validateRedirectUriScheme(redirectUri);
 
-    // Parse and validate resource parameter (RFC 8707)
     const resource = parseResourceParameter(resourceParam);
     if (resourceParam && !resource) {
       throw new Error('The resource parameter must be a valid absolute URI without a fragment');
     }
 
-    // Check if implicit flow is requested but not allowed
     if (responseType === 'token' && !this.provider.options.allowImplicitFlow) {
       throw new Error('The implicit grant flow is not enabled for this provider');
     }
 
-    // Check if plain PKCE method is used but not allowed (OAuth 2.1 recommends S256 only)
-    if (codeChallengeMethod === 'plain' && this.provider.options.allowPlainPKCE === false) {
+    if (codeChallengeMethod === 'plain' && !this.provider.options.allowPlainPKCE) {
       throw new Error('The plain PKCE method is not allowed. Use S256 instead.');
     }
 
-    // Validate the client ID and redirect URI
     if (clientId) {
       const clientInfo = await this.lookupClient(clientId);
 
       if (!clientInfo) {
         throw new Error(`Invalid client. The clientId provided does not match to this client.`);
       }
-      // If client exists, validate the redirect URI against registered URIs
       if (clientInfo && redirectUri) {
         if (!isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
           throw new Error(
@@ -3775,22 +3444,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
     };
   }
 
-  /**
-   * Looks up a client by its client ID
-   * @param clientId - The client ID to look up
-   * @returns A Promise resolving to the client info, or null if not found
-   */
   async lookupClient(clientId: string): Promise<ClientInfo | null> {
-    return await this.provider.getClient(this.env, clientId);
+    return await this.provider.getClient(clientId);
   }
 
-  /**
-   * Completes an authorization request by creating a grant and either:
-   * - For authorization code flow: generating an authorization code
-   * - For implicit flow: generating an access token directly
-   * @param options - Options specifying the grant details
-   * @returns A Promise resolving to an object containing the redirect URL
-   */
   async completeAuthorization(options: CompleteAuthorizationOptions): Promise<{ redirectTo: string }> {
     const { clientId, redirectUri } = options.request;
 
@@ -3798,7 +3455,6 @@ class OAuthHelpersImpl implements OAuthHelpers {
       throw new Error('Client ID and Redirect URI are required in the authorization request.');
     }
 
-    // Re-validate the redirectUri to prevent open redirect vulnerabilities
     const clientInfo = await this.lookupClient(clientId);
     if (!clientInfo || !isValidRedirectUri(redirectUri, clientInfo.redirectUris)) {
       throw new Error(
@@ -3806,8 +3462,7 @@ class OAuthHelpersImpl implements OAuthHelpers {
       );
     }
 
-    // If requested, collect existing grants for this user+client to revoke AFTER the new grant is created.
-    // This avoids a data-loss window where the user has no grants if creation fails.
+    // Collect existing grants for revocation
     let grantsToRevoke: string[] = [];
     if (options.revokeExistingGrants !== false) {
       let cursor: string | undefined;
@@ -3822,38 +3477,26 @@ class OAuthHelpersImpl implements OAuthHelpers {
       } while (cursor);
     }
 
-    // Generate a unique grant ID
     const grantId = generateRandomString(16);
-
-    // Encrypt the props data with a new key generated for this grant
     const { encryptedData, key: encryptionKey } = await encryptProps(options.props);
-
-    // Get current timestamp
     const now = Math.floor(Date.now() / 1000);
 
     // Check if this is an implicit flow request (response_type=token)
     if (options.request.responseType === 'token') {
-      // For implicit flow, we skip the authorization code and directly issue an access token
       const accessTokenSecret = generateRandomString(TOKEN_LENGTH);
       const accessToken = `${options.userId}:${grantId}:${accessTokenSecret}`;
-
-      // Generate token ID from the full token string
       const accessTokenId = await generateTokenId(accessToken);
 
-      // Determine token expiration
       const accessTokenTTL = this.provider.options.accessTokenTTL || DEFAULT_ACCESS_TOKEN_TTL;
       const accessTokenExpiresAt = now + accessTokenTTL;
 
-      // Wrap the encryption key with the access token
       const accessTokenWrappedKey = await wrapKeyWithToken(accessToken, encryptionKey);
 
-      // Parse and validate resource parameter (RFC 8707) for implicit flow
       const audience = parseResourceParameter(options.request.resource);
       if (options.request.resource && !audience) {
         throw new Error('The resource parameter must be a valid absolute URI without a fragment');
       }
 
-      // Store the grant without an auth code (will be referenced by the access token)
       const grant: Grant = {
         id: grantId,
         clientId: options.request.clientId,
@@ -3865,11 +3508,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
         resource: options.request.resource,
       };
 
-      // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant));
+      await this.storage.put(grantKey, JSON.stringify(grant));
 
-      // Store access token with denormalized grant information
       const accessTokenData: Token = {
         id: accessTokenId,
         grantId: grantId,
@@ -3886,14 +3527,10 @@ class OAuthHelpersImpl implements OAuthHelpers {
         },
       };
 
-      // Save access token with TTL
-      await this.env.OAUTH_KV.put(
-        `token:${options.userId}:${grantId}:${accessTokenId}`,
-        JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
-      );
+      await this.storage.put(`token:${options.userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+        expirationTtl: accessTokenTTL,
+      });
 
-      // Build the redirect URL for implicit flow (token in fragment, not query params)
       const redirectUrl = new URL(options.request.redirectUri);
       const fragment = new URLSearchParams();
       fragment.set('access_token', accessToken);
@@ -3905,30 +3542,22 @@ class OAuthHelpersImpl implements OAuthHelpers {
         fragment.set('state', options.request.state);
       }
 
-      // Set the fragment (hash) part of the URL
       redirectUrl.hash = fragment.toString();
 
-      // Revoke old grants AFTER the new grant is successfully stored
       try {
         await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
       } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
+        // Best-effort revocation
       }
 
       return { redirectTo: redirectUrl.toString() };
     } else {
       // Standard authorization code flow
-      // Generate an authorization code with embedded user and grant IDs
       const authCodeSecret = generateRandomString(32);
       const authCode = `${options.userId}:${grantId}:${authCodeSecret}`;
-
-      // Hash the authorization code
       const authCodeId = await hashSecret(authCode);
-
-      // Wrap the encryption key with the auth code
       const authCodeWrappedKey = await wrapKeyWithToken(authCode, encryptionKey);
 
-      // Store the grant with the auth code hash
       const grant: Grant = {
         id: grantId,
         clientId: options.request.clientId,
@@ -3937,52 +3566,39 @@ class OAuthHelpersImpl implements OAuthHelpers {
         metadata: options.metadata,
         encryptedProps: encryptedData,
         createdAt: now,
-        authCodeId: authCodeId, // Store the auth code hash in the grant
-        authCodeWrappedKey: authCodeWrappedKey, // Store the wrapped key
-        // Store PKCE parameters if provided
+        authCodeId: authCodeId,
+        authCodeWrappedKey: authCodeWrappedKey,
         codeChallenge: options.request.codeChallenge,
         codeChallengeMethod: options.request.codeChallengeMethod,
         resource: options.request.resource,
       };
 
-      // Store the grant with a key that includes the user ID
       const grantKey = `grant:${options.userId}:${grantId}`;
-
-      // Set 10-minute TTL for the grant (will be extended when code is exchanged)
       const codeExpiresIn = 600; // 10 minutes
-      await this.env.OAUTH_KV.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
+      await this.storage.put(grantKey, JSON.stringify(grant), { expirationTtl: codeExpiresIn });
 
-      // Build the redirect URL for authorization code flow
       const redirectUrl = new URL(options.request.redirectUri);
       redirectUrl.searchParams.set('code', authCode);
       if (options.request.state) {
         redirectUrl.searchParams.set('state', options.request.state);
       }
 
-      // Revoke old grants AFTER the new grant is successfully stored
       try {
         await Promise.allSettled(grantsToRevoke.map((oldGrantId) => this.revokeGrant(oldGrantId, options.userId)));
       } catch {
-        // Best-effort revocation — new grant is already stored, don't fail the authorization
+        // Best-effort revocation
       }
 
       return { redirectTo: redirectUrl.toString() };
     }
   }
 
-  /**
-   * Creates a new OAuth client
-   * @param clientInfo - Partial client information to create the client with
-   * @returns A Promise resolving to the created client info
-   */
   async createClient(clientInfo: Partial<ClientInfo>): Promise<ClientInfo> {
     const clientId = generateRandomString(16);
 
-    // Determine token endpoint auth method
     const tokenEndpointAuthMethod = clientInfo.tokenEndpointAuthMethod || 'client_secret_basic';
     const isPublicClient = tokenEndpointAuthMethod === 'none';
 
-    // Create a new client object
     const newClient: ClientInfo = {
       clientId,
       redirectUris: clientInfo.redirectUris || [],
@@ -4003,39 +3619,28 @@ class OAuthHelpersImpl implements OAuthHelpers {
       tokenEndpointAuthMethod,
     };
 
-    // Validate each redirect URI scheme
     for (const uri of newClient.redirectUris) {
       validateRedirectUriScheme(uri);
     }
 
-    // Only generate and store client secret for confidential clients
     let clientSecret: string | undefined;
     if (!isPublicClient) {
       clientSecret = generateRandomString(32);
-      // Hash the client secret
       newClient.clientSecret = await hashSecret(clientSecret);
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(newClient));
+    await this.storage.put(`client:${clientId}`, JSON.stringify(newClient));
 
-    // Create the response object
     const clientResponse = { ...newClient };
 
-    // Return confidential clients with their unhashed secret
     if (!isPublicClient && clientSecret) {
-      clientResponse.clientSecret = clientSecret; // Return original unhashed secret
+      clientResponse.clientSecret = clientSecret;
     }
 
     return clientResponse;
   }
 
-  /**
-   * Lists all registered OAuth clients with pagination support
-   * @param options - Optional pagination parameters (limit and cursor)
-   * @returns A Promise resolving to the list result with items and optional cursor
-   */
   async listClients(options?: ListOptions): Promise<ListResult<ClientInfo>> {
-    // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: 'client:',
     };
@@ -4048,14 +3653,12 @@ class OAuthHelpersImpl implements OAuthHelpers {
       listOptions.cursor = options.cursor;
     }
 
-    // Use the KV list() function to get client keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    const response = await this.storage.list(listOptions);
 
-    // Fetch all clients in parallel
     const clients: ClientInfo[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
       const clientId = key.name.substring('client:'.length);
-      const client = await this.provider.getClient(this.env, clientId);
+      const client = await this.provider.getClient(clientId);
       if (client) {
         clients.push(client);
       }
@@ -4063,38 +3666,27 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     await Promise.all(promises);
 
-    // Return result with cursor if there are more results
     return {
       items: clients,
       cursor: response.list_complete ? undefined : response.cursor,
     };
   }
 
-  /**
-   * Updates an existing OAuth client
-   * @param clientId - The ID of the client to update
-   * @param updates - Partial client information with fields to update
-   * @returns A Promise resolving to the updated client info, or null if not found
-   */
   async updateClient(clientId: string, updates: Partial<ClientInfo>): Promise<ClientInfo | null> {
-    const client = await this.provider.getClient(this.env, clientId);
+    const client = await this.provider.getClient(clientId);
     if (!client) {
       return null;
     }
 
-    // Determine token endpoint auth method
     let authMethod = updates.tokenEndpointAuthMethod || client.tokenEndpointAuthMethod || 'client_secret_basic';
     const isPublicClient = authMethod === 'none';
 
-    // Handle changes in auth method
     let secretToStore = client.clientSecret;
     let originalSecret: string | undefined = undefined;
 
     if (isPublicClient) {
-      // Public clients don't have secrets
       secretToStore = undefined;
     } else if (updates.clientSecret) {
-      // For confidential clients, handle secret updates if provided
       originalSecret = updates.clientSecret;
       secretToStore = await hashSecret(updates.clientSecret);
     }
@@ -4102,23 +3694,20 @@ class OAuthHelpersImpl implements OAuthHelpers {
     const updatedClient: ClientInfo = {
       ...client,
       ...updates,
-      clientId: client.clientId, // Ensure clientId doesn't change
-      tokenEndpointAuthMethod: authMethod, // Use determined auth method
+      clientId: client.clientId,
+      tokenEndpointAuthMethod: authMethod,
     };
 
-    // Only include client secret for confidential clients
     if (!isPublicClient && secretToStore) {
       updatedClient.clientSecret = secretToStore;
     } else {
       delete updatedClient.clientSecret;
     }
 
-    await this.env.OAUTH_KV.put(`client:${clientId}`, JSON.stringify(updatedClient));
+    await this.storage.put(`client:${clientId}`, JSON.stringify(updatedClient));
 
-    // Create a response object
     const response = { ...updatedClient };
 
-    // For confidential clients, return unhashed secret if a new one was provided
     if (!isPublicClient && originalSecret) {
       response.clientSecret = originalSecret;
     }
@@ -4126,25 +3715,11 @@ class OAuthHelpersImpl implements OAuthHelpers {
     return response;
   }
 
-  /**
-   * Deletes an OAuth client
-   * @param clientId - The ID of the client to delete
-   * @returns A Promise resolving when the deletion is confirmed.
-   */
   async deleteClient(clientId: string): Promise<void> {
-    // Delete client
-    await this.env.OAUTH_KV.delete(`client:${clientId}`);
+    await this.storage.delete(`client:${clientId}`);
   }
 
-  /**
-   * Lists all authorization grants for a specific user with pagination support
-   * Returns a summary of each grant without sensitive information
-   * @param userId - The ID of the user whose grants to list
-   * @param options - Optional pagination parameters (limit and cursor)
-   * @returns A Promise resolving to the list result with grant summaries and optional cursor
-   */
   async listUserGrants(userId: string, options?: ListOptions): Promise<ListResult<GrantSummary>> {
-    // Prepare list options for KV
     const listOptions: { limit?: number; cursor?: string; prefix: string } = {
       prefix: `grant:${userId}:`,
     };
@@ -4157,15 +3732,13 @@ class OAuthHelpersImpl implements OAuthHelpers {
       listOptions.cursor = options.cursor;
     }
 
-    // Use the KV list() function to get grant keys with pagination
-    const response = await this.env.OAUTH_KV.list(listOptions);
+    const response = await this.storage.list(listOptions);
 
-    // Fetch all grants in parallel and convert to grant summaries
     const grantSummaries: GrantSummary[] = [];
     const promises = response.keys.map(async (key: { name: string }) => {
-      const grantData: Grant | null = await this.env.OAUTH_KV.get(key.name, { type: 'json' });
+      const raw = await this.storage.get(key.name);
+      const grantData: Grant | null = raw ? JSON.parse(raw) : null;
       if (grantData) {
-        // Create a summary with only the public fields
         const summary: GrantSummary = {
           id: grantData.id,
           clientId: grantData.clientId,
@@ -4181,31 +3754,19 @@ class OAuthHelpersImpl implements OAuthHelpers {
 
     await Promise.all(promises);
 
-    // Return result with cursor if there are more results
     return {
       items: grantSummaries,
       cursor: response.list_complete ? undefined : response.cursor,
     };
   }
 
-  /**
-   * Revokes an authorization grant and all its associated access tokens
-   * @param grantId - The ID of the grant to revoke
-   * @param userId - The ID of the user who owns the grant
-   * @returns A Promise resolving when the revocation is confirmed.
-   */
   async revokeGrant(grantId: string, userId: string): Promise<void> {
-    // Construct the full grant key with user ID
     const grantKey = `grant:${userId}:${grantId}`;
-
-    // Delete all access tokens associated with this grant
     const tokenPrefix = `token:${userId}:${grantId}:`;
 
-    // Handle pagination to ensure we delete all tokens even if there are more than 1000
     let cursor: string | undefined;
     let allTokensDeleted = false;
 
-    // Continue fetching and deleting tokens until we've processed all of them
     while (!allTokensDeleted) {
       const listOptions: { prefix: string; cursor?: string } = {
         prefix: tokenPrefix,
@@ -4215,18 +3776,16 @@ class OAuthHelpersImpl implements OAuthHelpers {
         listOptions.cursor = cursor;
       }
 
-      const result = await this.env.OAUTH_KV.list(listOptions);
+      const result = await this.storage.list(listOptions);
 
-      // Delete each token in this batch
       if (result.keys.length > 0) {
         await Promise.all(
           result.keys.map((key: { name: string }) => {
-            return this.env.OAUTH_KV.delete(key.name);
+            return this.storage.delete(key.name);
           })
         );
       }
 
-      // Check if we need to fetch more tokens
       if (result.list_complete) {
         allTokensDeleted = true;
       } else {
@@ -4234,27 +3793,14 @@ class OAuthHelpersImpl implements OAuthHelpers {
       }
     }
 
-    // After all tokens are deleted, delete the grant itself
-    await this.env.OAUTH_KV.delete(grantKey);
+    await this.storage.delete(grantKey);
   }
 
-  /**
-   * Decodes a token and returns token data with decrypted props
-   * @param token - The token
-   * @returns Promise resolving to token data with decrypted props, or null if token is invalid
-   */
   async unwrapToken<T = any>(token: string): Promise<TokenSummary<T> | null> {
-    return await this.provider.unwrapToken(token, this.env);
+    return await this.provider.unwrapToken(token);
   }
 
-  /**
-   * Exchanges an existing access token for a new one with modified characteristics
-   * Implements OAuth 2.0 Token Exchange (RFC 8693)
-   * @param options - Options for token exchange including subject token and optional modifications
-   * @returns Promise resolving to token response with new access token
-   */
   async exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
-    // Validate subject token first to get client info
     const tokenSummary = await this.unwrapToken(options.subjectToken);
     if (!tokenSummary) {
       throw new Error('Invalid or expired subject token');
@@ -4265,21 +3811,19 @@ class OAuthHelpersImpl implements OAuthHelpers {
       throw new Error('Client not found');
     }
 
-    // Perform the token exchange using the shared method
-    // Errors will be thrown directly from exchangeToken with appropriate messages
     return await this.provider.exchangeToken(
       options.subjectToken,
       options.scope,
       options.aud,
       options.expiresIn,
       clientInfo,
-      this.env
+      options.actorToken,
+      options.actorTokenType
     );
   }
 }
 
 /**
  * Default export of the OAuth provider
- * This allows users to import the library and use it directly as in the example
  */
 export default OAuthProvider;

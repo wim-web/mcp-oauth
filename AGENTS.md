@@ -1,6 +1,29 @@
 # AGENTS.md
 
-## Project overview
+## Fork notice
+
+This repo is a fork of `@cloudflare/workers-oauth-provider`. The sole purpose of this fork is to remove Cloudflare Workers dependencies so the library can run on any platform (e.g. Next.js, Node.js).
+
+### Critical rule: `src/oauth-provider.ts`
+
+`src/oauth-provider.ts` is the core file ported from upstream. **Do not add features, refactor logic, or extend interfaces in this file.** Changes to this file must be limited to:
+
+- Removing or replacing Cloudflare-specific APIs (KV, Durable Objects, etc.)
+- Fixing imports/types required by the platform migration
+- Formatting (prettier)
+
+Any new functionality belongs in separate files like `src/next.ts` or new modules. Do not modify upstream types (`Grant`, `ResolveExternalTokenResult`, `TokenSummary`, etc.) for downstream convenience.
+
+The goal is to keep `src/oauth-provider.ts` as close to upstream as possible so that future upstream changes can be merged with minimal conflict.
+
+### Fork-specific files
+
+- `src/next.ts` — Next.js App Router helpers (`createOAuthHandlers`, `getAuth`)
+- `src/oidc/` — OIDC discovery and ID token verification helpers
+
+---
+
+## Project overview (upstream)
 
 `@cloudflare/workers-oauth-provider` is a production-grade OAuth 2.1 provider library for Cloudflare Workers. It implements authorization code flow with PKCE, dynamic client registration, token exchange, and end-to-end encryption of sensitive data stored in KV.
 

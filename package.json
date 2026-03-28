@@ -1,16 +1,28 @@
 {
-  "name": "@cloudflare/workers-oauth-provider",
+  "name": "mcp-oauth",
   "version": "0.3.1",
-  "description": "OAuth provider for Cloudflare Workers",
+  "description": "Platform-independent OAuth 2.1 authorization provider",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "import": "./dist/oauth-provider.js",
+      "types": "./dist/oauth-provider.d.ts"
+    },
+    "./next": {
+      "import": "./dist/next.js",
+      "types": "./dist/next.d.ts"
+    },
+    "./oidc": {
+      "import": "./dist/oidc/index.js",
+      "types": "./dist/oidc/index.d.ts"
+    }
+  },
   "main": "dist/oauth-provider.js",
   "types": "dist/oauth-provider.d.ts",
-  "author": "Kenton Varda <kenton@cloudflare.com>",
-  "license": "MIT",
-  "sideEffects": false,
   "files": [
     "dist"
   ],
-  "type": "module",
   "publishConfig": {
     "access": "public"
   },
@@ -21,13 +33,15 @@
     "typecheck": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build",
-    "prettier": "prettier -w ."
+    "prettier": "prettier -w .",
+    "prepublishOnly": "npm run build"
   },
+  "author": "Kenton Varda <kenton@cloudflare.com>",
+  "license": "MIT",
   "devDependencies": {
     "@changesets/changelog-github": "^0.5.2",
     "@changesets/cli": "^2.29.8",
-    "@cloudflare/workers-types": "^4.20251218.0",
+    "@types/node": "^25.5.0",
     "pkg-pr-new": "^0.0.62",
     "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
@@ -36,10 +50,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cloudflare/workers-oauth-provider"
-  },
-  "bugs": {
-    "url": "https://github.com/cloudflare/workers-oauth-provider/issues"
-  },
-  "homepage": "https://github.com/cloudflare/workers-oauth-provider#readme"
+    "url": "https://github.com/wim-web/mcp-oauth-provider"
+  }
 }
