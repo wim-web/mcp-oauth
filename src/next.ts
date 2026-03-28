@@ -2,7 +2,6 @@ import {
   OAuthProvider,
   type TokenSummary,
   type ResolveExternalTokenInput,
-  type ResolveExternalTokenResult,
 } from './oauth-provider';
 
 /**
@@ -43,21 +42,14 @@ export function createOAuthHandlers(provider: OAuthProvider): OAuthRouteHandlers
 }
 
 /**
- * Successful authentication with an internal token (managed by OAuthProvider)
+ * Successful authentication result.
+ * For external tokens, metadata fields other than `grant.props` and `audience`
+ * may contain placeholder values.
  */
 export interface AuthResult<T = any> {
   authenticated: true;
-  external?: false;
   token: TokenSummary<T>;
-}
-
-/**
- * Successful authentication with an external token (resolved via callback)
- */
-export interface ExternalAuthResult<T = any> {
-  authenticated: true;
-  external: true;
-  props: T;
+  external?: true;
   audience?: string | string[];
 }
 
@@ -76,22 +68,19 @@ export interface GetAuthOptions {
   /**
    * Optional callback to resolve external (non-internal) Bearer tokens.
    * Called when `unwrapToken` returns null.
-   *
-   * This should be the same `resolveExternalToken` passed to `OAuthProviderOptions`.
-   * It is required here because `OAuthProvider` does not expose its internal options,
-   * and `getAuth` cannot access them without modifying the upstream core.
    */
-  resolveExternalToken?: (input: ResolveExternalTokenInput) => Promise<ResolveExternalTokenResult | null>;
+  resolveExternalToken?: NonNullable<ReturnType<OAuthProvider['getResolveExternalToken']>>;
 }
 
 /**
  * Extract and verify the Bearer token from a request.
  *
  * Validates the token via `unwrapToken`, checks audience constraints against the
- * request URL, and optionally falls back to an external token resolver.
+ * request URL, and falls back to an external token resolver if configured.
  *
- * Without options: returns `AuthResult | AuthFailure` (backwards compatible).
- * With `resolveExternalToken`: may also return `ExternalAuthResult`.
+ * The external resolver is looked up in this order:
+ * 1. `options.resolveExternalToken` (explicit per-call override)
+ * 2. `provider`'s configured `resolveExternalToken`
  *
  * Note: `unwrapToken` returns null for both missing and expired internal tokens.
  * When `resolveExternalToken` is configured, expired internal tokens may reach
@@ -100,15 +89,14 @@ export interface GetAuthOptions {
  *
  * Usage:
  * ```typescript
- * // Internal tokens only (backwards compatible)
+ * const provider = new OAuthProvider({ ...options, resolveExternalToken });
  * const auth = await getAuth(provider, request);
- * if (!auth.authenticated) return auth.error;
- * auth.token.grant.props // TokenSummary
  *
- * // With external token support
+ * // Or pass resolveExternalToken explicitly per call
  * const auth = await getAuth(provider, request, { resolveExternalToken });
+ *
  * if (!auth.authenticated) return auth.error;
- * if (auth.external) { auth.props } else { auth.token }
+ * auth.token.grant.props // Always available
  * ```
  */
 export function getAuth<T = any>(
@@ -118,13 +106,13 @@ export function getAuth<T = any>(
 export function getAuth<T = any>(
   provider: OAuthProvider,
   request: Request,
-  options?: GetAuthOptions
-): Promise<AuthResult<T> | ExternalAuthResult<T> | AuthFailure>;
+  options: GetAuthOptions
+): Promise<AuthResult<T> | AuthFailure>;
 export async function getAuth<T = any>(
   provider: OAuthProvider,
   request: Request,
   options?: GetAuthOptions
-): Promise<AuthResult<T> | ExternalAuthResult<T> | AuthFailure> {
+): Promise<AuthResult<T> | AuthFailure> {
   const authHeader = request.headers.get('Authorization');
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -149,19 +137,37 @@ export async function getAuth<T = any>(
     if (!validateAudience(tokenSummary.audience, request)) {
       return audienceMismatchResponse();
     }
-    return { authenticated: true, external: false, token: tokenSummary };
+    return { authenticated: true, token: tokenSummary };
   }
 
   // Fall back to external token resolution.
-  // This mirrors OAuthProvider.fetch(), which tries resolveExternalToken when the
-  // internal token lookup fails, regardless of the token's format.
-  if (options?.resolveExternalToken) {
-    const ext = await options.resolveExternalToken({ token: rawToken, request });
+  // Explicit options take precedence; otherwise use the resolver configured on the provider.
+  const resolver = options?.resolveExternalToken ?? provider.getResolveExternalToken();
+  if (resolver) {
+    const ext = await resolver({ token: rawToken, request });
     if (ext) {
       if (!validateAudience(ext.audience, request)) {
         return audienceMismatchResponse();
       }
-      return { authenticated: true, external: true, props: ext.props as T, audience: ext.audience };
+      return {
+        authenticated: true,
+        external: true,
+        audience: ext.audience,
+        token: {
+          id: '',
+          grantId: '',
+          userId: '',
+          createdAt: 0,
+          expiresAt: 0,
+          audience: ext.audience,
+          scope: [],
+          grant: {
+            clientId: '',
+            scope: [],
+            props: ext.props as T,
+          },
+        },
+      };
     }
   }
 
@@ -175,29 +181,6 @@ export async function getAuth<T = any>(
       },
     }),
   };
-}
-
-/**
- * Create a pre-configured `getAuth` function with options bound once.
- *
- * This avoids repeating `resolveExternalToken` on every call, which is necessary
- * because `OAuthProvider` does not expose its internal options and `getAuth` cannot
- * read them without modifying the upstream core.
- *
- * Usage:
- * ```typescript
- * // Set up once (e.g. in a shared auth module)
- * const authChecker = createGetAuth(provider, { resolveExternalToken });
- *
- * // Use in route handlers — no need to pass options each time
- * export async function GET(request: Request) {
- *   const auth = await authChecker(request);
- *   if (!auth.authenticated) return auth.error;
- * }
- * ```
- */
-export function createGetAuth<T = any>(provider: OAuthProvider, options: GetAuthOptions) {
-  return (request: Request) => getAuth<T>(provider, request, options);
 }
 
 /**

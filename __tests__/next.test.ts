@@ -2,11 +2,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createOAuthHandlers,
   getAuth,
-  createGetAuth,
   OAuthProvider,
   MemoryStore,
   type OAuthContext,
-  type ExternalAuthResult,
 } from '../src/next';
 
 // Simple API handler for testing
@@ -236,10 +234,9 @@ describe('getAuth', () => {
 
     expect(result.authenticated).toBe(true);
     if (result.authenticated) {
-      const ext = result as ExternalAuthResult;
-      expect(ext.external).toBe(true);
-      expect(ext.props.sub).toBe('ext-user');
-      expect(ext.props.plan).toBe('pro');
+      expect(result.external).toBe(true);
+      expect(result.token.grant.props.sub).toBe('ext-user');
+      expect(result.token.grant.props.plan).toBe('pro');
     }
   });
 
@@ -265,27 +262,39 @@ describe('getAuth', () => {
     }
   });
 
-  it('should resolve external token via createGetAuth factory', async () => {
-    const resolver = async ({ token }: { token: string }) => {
-      if (token === 'factory-ext-token') {
-        return { props: { sub: 'factory-user' } };
-      }
-      return null;
-    };
-
-    const authChecker = createGetAuth(provider, { resolveExternalToken: resolver });
-
-    const request = createMockRequest('https://example.com/api/data', 'GET', {
-      Authorization: 'Bearer factory-ext-token',
+  it('should auto-resolve external token from provider configuration', async () => {
+    const providerWithResolver = new OAuthProvider({
+      apiRoute: '/api/',
+      apiHandler: testApiHandler,
+      defaultHandler: {
+        async fetch() {
+          return new Response('OK', { status: 200 });
+        },
+      },
+      authorizeEndpoint: '/authorize',
+      tokenEndpoint: '/oauth/token',
+      scopesSupported: ['read', 'write'],
+      storage: new MemoryStore(),
+      resolveExternalToken: async ({ token }) => {
+        if (token === 'auto-ext-token') {
+          return { props: { sub: 'auto-user', plan: 'enterprise' } };
+        }
+        return null;
+      },
     });
 
-    const result = await authChecker(request);
+    const request = createMockRequest('https://example.com/api/data', 'GET', {
+      Authorization: 'Bearer auto-ext-token',
+    });
+
+    // 2-arg getAuth automatically uses the registered resolver
+    const result = await getAuth(providerWithResolver, request);
 
     expect(result.authenticated).toBe(true);
     if (result.authenticated) {
-      const ext = result as ExternalAuthResult;
-      expect(ext.external).toBe(true);
-      expect(ext.props.sub).toBe('factory-user');
+      expect(result.external).toBe(true);
+      expect(result.token.grant.props.sub).toBe('auto-user');
+      expect(result.token.grant.props.plan).toBe('enterprise');
     }
   });
 

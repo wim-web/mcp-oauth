@@ -1179,6 +1179,14 @@ export class OAuthProvider implements OAuthHelpers {
     return this.#helpers.unwrapToken(token);
   }
 
+  /**
+   * Returns the configured external token resolver, if any.
+   * Intended for framework adapters that need to mirror `fetch()` authentication behavior.
+   */
+  getResolveExternalToken(): OAuthProviderOptions['resolveExternalToken'] {
+    return this.#impl.getResolveExternalToken();
+  }
+
   exchangeToken(options: ExchangeTokenOptions): Promise<TokenResponse> {
     return this.#helpers.exchangeToken(options);
   }
@@ -1284,6 +1292,10 @@ class OAuthProviderImpl {
         console.warn(`OAuth error response: ${status} ${code} - ${description}`),
       ...options,
     };
+  }
+
+  getResolveExternalToken(): OAuthProviderOptions['resolveExternalToken'] {
+    return this.options.resolveExternalToken;
   }
 
   /**
