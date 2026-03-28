@@ -1,11 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import {
-  createOAuthHandlers,
-  getAuth,
-  OAuthProvider,
-  MemoryStore,
-  type OAuthContext,
-} from '../src/next';
+import { createOAuthHandlers, getAuth, OAuthProvider, MemoryStore, type OAuthContext } from '../src/next';
 
 // Simple API handler for testing
 const testApiHandler = {

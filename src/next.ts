@@ -1,8 +1,4 @@
-import {
-  OAuthProvider,
-  type TokenSummary,
-  type ResolveExternalTokenInput,
-} from './oauth-provider';
+import { OAuthProvider, type TokenSummary, type ResolveExternalTokenInput } from './oauth-provider';
 
 /**
  * Next.js App Router route handler signature
@@ -99,10 +95,7 @@ export interface GetAuthOptions {
  * auth.token.grant.props // Always available
  * ```
  */
-export function getAuth<T = any>(
-  provider: OAuthProvider,
-  request: Request
-): Promise<AuthResult<T> | AuthFailure>;
+export function getAuth<T = any>(provider: OAuthProvider, request: Request): Promise<AuthResult<T> | AuthFailure>;
 export function getAuth<T = any>(
   provider: OAuthProvider,
   request: Request,
