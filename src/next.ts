@@ -178,6 +178,29 @@ export async function getAuth<T = any>(
 }
 
 /**
+ * Create a pre-configured `getAuth` function with options bound once.
+ *
+ * This avoids repeating `resolveExternalToken` on every call, which is necessary
+ * because `OAuthProvider` does not expose its internal options and `getAuth` cannot
+ * read them without modifying the upstream core.
+ *
+ * Usage:
+ * ```typescript
+ * // Set up once (e.g. in a shared auth module)
+ * const authChecker = createGetAuth(provider, { resolveExternalToken });
+ *
+ * // Use in route handlers — no need to pass options each time
+ * export async function GET(request: Request) {
+ *   const auth = await authChecker(request);
+ *   if (!auth.authenticated) return auth.error;
+ * }
+ * ```
+ */
+export function createGetAuth<T = any>(provider: OAuthProvider, options: GetAuthOptions) {
+  return (request: Request) => getAuth<T>(provider, request, options);
+}
+
+/**
  * Validate audience constraint against a request URL.
  * Returns true if no audience is set or it matches.
  */

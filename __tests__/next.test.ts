@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createOAuthHandlers,
   getAuth,
+  createGetAuth,
   OAuthProvider,
   MemoryStore,
   type OAuthContext,
@@ -261,6 +262,30 @@ describe('getAuth', () => {
       expect(result.error.status).toBe(401);
       const body = (await result.error.json()) as any;
       expect(body.error_description).toContain('audience');
+    }
+  });
+
+  it('should resolve external token via createGetAuth factory', async () => {
+    const resolver = async ({ token }: { token: string }) => {
+      if (token === 'factory-ext-token') {
+        return { props: { sub: 'factory-user' } };
+      }
+      return null;
+    };
+
+    const authChecker = createGetAuth(provider, { resolveExternalToken: resolver });
+
+    const request = createMockRequest('https://example.com/api/data', 'GET', {
+      Authorization: 'Bearer factory-ext-token',
+    });
+
+    const result = await authChecker(request);
+
+    expect(result.authenticated).toBe(true);
+    if (result.authenticated) {
+      const ext = result as ExternalAuthResult;
+      expect(ext.external).toBe(true);
+      expect(ext.props.sub).toBe('factory-user');
     }
   });
 
