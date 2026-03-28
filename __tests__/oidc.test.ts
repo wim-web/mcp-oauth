@@ -12,10 +12,12 @@ import {
 // Helper to create a mock fetch that returns a JSON response
 function mockJsonFetch(body: unknown, status = 200): typeof globalThis.fetch {
   return vi.fn().mockImplementation(() =>
-    Promise.resolve(new Response(JSON.stringify(body), {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    }))
+    Promise.resolve(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    )
   ) as unknown as typeof globalThis.fetch;
 }
 
@@ -59,9 +61,7 @@ describe('discoverOIDC', () => {
     const mismatchedConfig = { ...validOidcConfig, issuer: 'https://evil.example.com' };
     const fetchMock = mockJsonFetch(mismatchedConfig);
 
-    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow(
-      'OIDC issuer mismatch'
-    );
+    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow('OIDC issuer mismatch');
   });
 
   it('should throw on missing required fields', async () => {
@@ -76,17 +76,13 @@ describe('discoverOIDC', () => {
   it('should throw on HTTP error', async () => {
     const fetchMock = mockJsonFetch({ error: 'not found' }, 404);
 
-    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow(
-      'HTTP 404'
-    );
+    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow('HTTP 404');
   });
 
   it('should throw on network error', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('Connection refused')) as unknown as typeof globalThis.fetch;
 
-    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow(
-      'Connection refused'
-    );
+    await expect(discoverOIDC('https://idp.example.com', { fetch: fetchMock })).rejects.toThrow('Connection refused');
   });
 });
 
@@ -102,8 +98,7 @@ async function createSignedJwt(
   const payloadB64 = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
   const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
 
-  const algParams =
-    alg === 'RS256' ? 'RSASSA-PKCS1-v1_5' : { name: 'ECDSA', hash: 'SHA-256' };
+  const algParams = alg === 'RS256' ? 'RSASSA-PKCS1-v1_5' : { name: 'ECDSA', hash: 'SHA-256' };
   const signature = await crypto.subtle.sign(algParams, keyPair.privateKey, signingInput);
   const signatureB64 = base64UrlEncode(new Uint8Array(signature));
 
@@ -124,11 +119,7 @@ async function generateRS256KeyPair(): Promise<CryptoKeyPair> {
 }
 
 async function generateES256KeyPair(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey(
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['sign', 'verify']
-  );
+  return crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
 }
 
 describe('verifyIdToken', () => {
@@ -350,25 +341,25 @@ describe('fetchUserInfo', () => {
   it('should throw on HTTP error', async () => {
     const fetchMock = mockJsonFetch({ error: 'unauthorized' }, 401);
 
-    await expect(
-      fetchUserInfo('bad-token', 'https://idp.example.com/userinfo', { fetch: fetchMock })
-    ).rejects.toThrow('HTTP 401');
+    await expect(fetchUserInfo('bad-token', 'https://idp.example.com/userinfo', { fetch: fetchMock })).rejects.toThrow(
+      'HTTP 401'
+    );
   });
 
   it('should throw on missing sub claim', async () => {
     const fetchMock = mockJsonFetch({ name: 'No Sub User' });
 
-    await expect(
-      fetchUserInfo('token', 'https://idp.example.com/userinfo', { fetch: fetchMock })
-    ).rejects.toThrow('missing required field: sub');
+    await expect(fetchUserInfo('token', 'https://idp.example.com/userinfo', { fetch: fetchMock })).rejects.toThrow(
+      'missing required field: sub'
+    );
   });
 
   it('should throw on network error', async () => {
     const fetchMock = vi.fn().mockRejectedValue(new Error('Network failure')) as unknown as typeof globalThis.fetch;
 
-    await expect(
-      fetchUserInfo('token', 'https://idp.example.com/userinfo', { fetch: fetchMock })
-    ).rejects.toThrow('Network failure');
+    await expect(fetchUserInfo('token', 'https://idp.example.com/userinfo', { fetch: fetchMock })).rejects.toThrow(
+      'Network failure'
+    );
   });
 });
 

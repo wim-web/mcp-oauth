@@ -41,11 +41,7 @@ export interface VerifyIdTokenOptions {
 /**
  * Fetch a JWKS from a URL with timeout
  */
-async function fetchJwks(
-  jwksUri: string,
-  fetchFn: typeof globalThis.fetch,
-  timeoutMs: number
-): Promise<Jwks> {
+async function fetchJwks(jwksUri: string, fetchFn: typeof globalThis.fetch, timeoutMs: number): Promise<Jwks> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -84,10 +80,7 @@ function findKey(jwks: Jwks, kid: string | undefined, alg: string): JwkKey | und
  * 4. Verify signature using Web Crypto API
  * 5. Validate claims (iss, aud, exp, iat, nonce)
  */
-export async function verifyIdToken(
-  token: string,
-  options: VerifyIdTokenOptions
-): Promise<IdTokenPayload> {
+export async function verifyIdToken(token: string, options: VerifyIdTokenOptions): Promise<IdTokenPayload> {
   const fetchFn = options.fetch ?? globalThis.fetch;
   const timeoutMs = options.timeoutMs ?? 10000;
   const clockTolerance = options.clockToleranceSec ?? 60;

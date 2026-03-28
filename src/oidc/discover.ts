@@ -26,10 +26,7 @@ export interface DiscoverOptions {
  * Fetch and validate the OIDC configuration for an issuer.
  * Constructs the well-known URL from the issuer per OpenID Connect Discovery 1.0 Section 4.
  */
-export async function discoverOIDC(
-  issuer: string,
-  options?: DiscoverOptions
-): Promise<OidcConfiguration> {
+export async function discoverOIDC(issuer: string, options?: DiscoverOptions): Promise<OidcConfiguration> {
   const fetchFn = options?.fetch ?? globalThis.fetch;
   const timeoutMs = options?.timeoutMs ?? 10000;
 
@@ -58,7 +55,7 @@ export async function discoverOIDC(
 
   let config: OidcConfiguration;
   try {
-    config = await response.json() as OidcConfiguration;
+    config = (await response.json()) as OidcConfiguration;
   } catch {
     throw new Error(`OIDC discovery failed for ${normalizedIssuer}: invalid JSON`);
   }

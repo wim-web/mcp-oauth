@@ -1,11 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import {
-  createOAuthHandlers,
-  getAuth,
-  OAuthProvider,
-  MemoryStore,
-  type OAuthContext,
-} from '../src/next';
+import { createOAuthHandlers, getAuth, OAuthProvider, MemoryStore, type OAuthContext } from '../src/next';
 
 // Simple API handler for testing
 const testApiHandler = {
@@ -66,10 +60,7 @@ describe('createOAuthHandlers', () => {
     const handlers = createOAuthHandlers(provider);
 
     // POST to a metadata endpoint triggers JSON response
-    const request = createMockRequest(
-      'https://example.com/.well-known/oauth-authorization-server',
-      'POST'
-    );
+    const request = createMockRequest('https://example.com/.well-known/oauth-authorization-server', 'POST');
     const response = await handlers.POST(request);
     // Metadata endpoint responds to GET; POST to non-matching path goes to default
     expect(response.status).toBe(200);
@@ -77,14 +68,10 @@ describe('createOAuthHandlers', () => {
 
   it('should handle OPTIONS for CORS preflight', async () => {
     const handlers = createOAuthHandlers(provider);
-    const request = createMockRequest(
-      'https://example.com/.well-known/oauth-protected-resource',
-      'OPTIONS',
-      {
-        Origin: 'https://client.example.com',
-        'Access-Control-Request-Method': 'GET',
-      }
-    );
+    const request = createMockRequest('https://example.com/.well-known/oauth-protected-resource', 'OPTIONS', {
+      Origin: 'https://client.example.com',
+      'Access-Control-Request-Method': 'GET',
+    });
 
     const response = await handlers.OPTIONS(request);
     expect(response.headers.get('Access-Control-Allow-Origin')).toBeDefined();

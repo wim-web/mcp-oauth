@@ -7038,9 +7038,7 @@ describe('OAuthProvider', () => {
 
     // --- Helpers for the OAuth dance ---
 
-    async function registerClient(
-      provider: OAuthProvider
-    ): Promise<{ clientId: string; clientSecret: string }> {
+    async function registerClient(provider: OAuthProvider): Promise<{ clientId: string; clientSecret: string }> {
       const response = await provider.fetch(
         createMockRequest(
           'https://example.com/oauth/register',
@@ -7057,10 +7055,7 @@ describe('OAuthProvider', () => {
       return { clientId: client.client_id, clientSecret: client.client_secret };
     }
 
-    async function authorizeAndGetCode(
-      provider: OAuthProvider,
-      clientId: string
-    ): Promise<string> {
+    async function authorizeAndGetCode(provider: OAuthProvider, clientId: string): Promise<string> {
       const authRequest = createMockRequest(
         `https://example.com/authorize?response_type=code&client_id=${clientId}` +
           `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}` +
@@ -7115,10 +7110,7 @@ describe('OAuthProvider', () => {
       }
     }
 
-    async function callApi(
-      provider: OAuthProvider,
-      accessToken: string
-    ): Promise<{ status: number; body: any }> {
+    async function callApi(provider: OAuthProvider, accessToken: string): Promise<{ status: number; body: any }> {
       const response = await provider.fetch(
         createMockRequest('https://example.com/api/test', 'GET', {
           Authorization: `Bearer ${accessToken}`,
@@ -7181,7 +7173,10 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: testApiHandler,
-          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize, () => provider),
+          defaultHandler: createDefaultHandlerNoRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7220,12 +7215,7 @@ describe('OAuthProvider', () => {
         expect(apiOld.body.user.upstreamToken).toBe('token-v1'); // stale!
 
         // BUG: Old refresh token STILL WORKS - client can keep getting stale v1 tokens
-        const refreshOld = await refreshTokens(
-          provider,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(200); // This is the root cause of infinite loops
 
         // Verify there are now TWO grants for the same user+client
@@ -7238,7 +7228,10 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: testApiHandler,
-          defaultHandler: createDefaultHandlerNoRevoke(() => propsFromAuthorize, () => provider),
+          defaultHandler: createDefaultHandlerNoRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7269,12 +7262,7 @@ describe('OAuthProvider', () => {
         const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Simulate upstream token expiry - refresh should fail with invalid_grant
-        const refresh1 = await refreshTokens(
-          provider,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refresh1 = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refresh1.status).toBe(400);
         expect(refresh1.error).toContain('invalid_grant');
 
@@ -7294,7 +7282,10 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: testApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, () => provider),
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7332,12 +7323,7 @@ describe('OAuthProvider', () => {
         expect(apiOld.status).toBe(401);
 
         // FIX: Old refresh token should also be INVALID
-        const refreshOld = await refreshTokens(
-          provider,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(400);
 
         // FIX: Only ONE grant should exist for this user+client
@@ -7350,7 +7336,10 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: testApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, () => provider),
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7381,12 +7370,7 @@ describe('OAuthProvider', () => {
         const tokens1 = await exchangeCodeForTokens(provider, code1, clientId, clientSecret);
 
         // Refresh fails because upstream token is expired
-        const refresh1 = await refreshTokens(
-          provider,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refresh1 = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refresh1.status).toBe(400);
         expect(refresh1.error).toContain('invalid_grant');
 
@@ -7396,21 +7380,11 @@ describe('OAuthProvider', () => {
         const tokens2 = await exchangeCodeForTokens(provider, code2, clientId, clientSecret);
 
         // FIX: Old refresh token FAILS immediately (grant was revoked)
-        const refreshOld = await refreshTokens(
-          provider,
-          tokens1.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshOld = await refreshTokens(provider, tokens1.refresh_token, clientId, clientSecret);
         expect(refreshOld.status).toBe(400);
 
         // New refresh token works correctly with fresh props
-        const refreshNew = await refreshTokens(
-          provider,
-          tokens2.refresh_token,
-          clientId,
-          clientSecret
-        );
+        const refreshNew = await refreshTokens(provider, tokens2.refresh_token, clientId, clientSecret);
         expect(refreshNew.status).toBe(200);
 
         // Only one grant should exist
@@ -7422,7 +7396,10 @@ describe('OAuthProvider', () => {
         const provider = new OAuthProvider({
           apiRoute: ['/api/'],
           apiHandler: testApiHandler,
-          defaultHandler: createDefaultHandlerWithRevoke(() => propsFromAuthorize, () => provider),
+          defaultHandler: createDefaultHandlerWithRevoke(
+            () => propsFromAuthorize,
+            () => provider
+          ),
           authorizeEndpoint: '/authorize',
           tokenEndpoint: '/oauth/token',
           clientRegistrationEndpoint: '/oauth/register',
@@ -7908,11 +7885,16 @@ describe('OAuthProvider', () => {
 
       // Register client
       const registerResponse = await provider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
-          redirect_uris: ['https://client.example.com/callback'],
-          client_name: 'Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
-        }))
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Test Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        )
       );
       const client = await registerResponse.json<any>();
 
@@ -7920,7 +7902,7 @@ describe('OAuthProvider', () => {
       const authResponse = await provider.fetch(
         createMockRequest(
           `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
-          `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz`
+            `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz`
         )
       );
       const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
@@ -7934,7 +7916,12 @@ describe('OAuthProvider', () => {
       tokenParams.append('client_secret', client.client_secret);
 
       const tokenResponse = await provider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, tokenParams.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          tokenParams.toString()
+        )
       );
       const tokens = await tokenResponse.json<any>();
 
@@ -7948,7 +7935,12 @@ describe('OAuthProvider', () => {
       params.append('client_id', clientId);
       params.append('client_secret', clientSecret);
       return provider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
       );
     }
 
@@ -8107,10 +8099,12 @@ describe('OAuthProvider', () => {
 
     it('should cache CIMD responses when cimdCacheTtl is set', async () => {
       const fetchMock = vi.fn().mockImplementation(() =>
-        Promise.resolve(new Response(JSON.stringify(cimdDocument), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }))
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
       );
 
       const { provider } = setupCimdProvider(300, fetchMock);
@@ -8128,10 +8122,12 @@ describe('OAuthProvider', () => {
 
     it('should re-fetch after cache expires', async () => {
       const fetchMock = vi.fn().mockImplementation(() =>
-        Promise.resolve(new Response(JSON.stringify(cimdDocument), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }))
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
       );
 
       const { provider } = setupCimdProvider(1, fetchMock);
@@ -8150,10 +8146,12 @@ describe('OAuthProvider', () => {
 
     it('should not cache when cimdCacheTtl is 0', async () => {
       const fetchMock = vi.fn().mockImplementation(() =>
-        Promise.resolve(new Response(JSON.stringify(cimdDocument), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }))
+        Promise.resolve(
+          new Response(JSON.stringify(cimdDocument), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        )
       );
 
       const { provider } = setupCimdProvider(0, fetchMock);
@@ -8168,10 +8166,12 @@ describe('OAuthProvider', () => {
       const fetchMock = vi.fn().mockImplementation(() => {
         callCount++;
         if (callCount === 1) {
-          return Promise.resolve(new Response(JSON.stringify(cimdDocument), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          }));
+          return Promise.resolve(
+            new Response(JSON.stringify(cimdDocument), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          );
         }
         return Promise.reject(new Error('Network error'));
       });
@@ -8251,11 +8251,16 @@ describe('OAuthProvider', () => {
 
       // Register client
       const registerResponse = await exchangeProvider.fetch(
-        createMockRequest('https://example.com/oauth/register', 'POST', { 'Content-Type': 'application/json' }, JSON.stringify({
-          redirect_uris: ['https://client.example.com/callback'],
-          client_name: 'Exchange Client',
-          token_endpoint_auth_method: 'client_secret_basic',
-        }))
+        createMockRequest(
+          'https://example.com/oauth/register',
+          'POST',
+          { 'Content-Type': 'application/json' },
+          JSON.stringify({
+            redirect_uris: ['https://client.example.com/callback'],
+            client_name: 'Exchange Client',
+            token_endpoint_auth_method: 'client_secret_basic',
+          })
+        )
       );
       const client = await registerResponse.json<any>();
       exchangeClientId = client.client_id;
@@ -8266,7 +8271,7 @@ describe('OAuthProvider', () => {
         const authResponse = await exchangeProvider.fetch(
           createMockRequest(
             `https://example.com/authorize?response_type=code&client_id=${exchangeClientId}` +
-            `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz&user=${user}`
+              `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz&user=${user}`
           )
         );
         const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
@@ -8279,7 +8284,12 @@ describe('OAuthProvider', () => {
         tokenParams.append('client_secret', exchangeClientSecret);
 
         const tokenResponse = await exchangeProvider.fetch(
-          createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, tokenParams.toString())
+          createMockRequest(
+            'https://example.com/oauth/token',
+            'POST',
+            { 'Content-Type': 'application/x-www-form-urlencoded' },
+            tokenParams.toString()
+          )
         );
         const tokens = await tokenResponse.json<any>();
         return tokens.access_token;
@@ -8300,7 +8310,12 @@ describe('OAuthProvider', () => {
       params.append('client_secret', exchangeClientSecret);
 
       const response = await exchangeProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
       );
       expect(response.status).toBe(200);
 
@@ -8321,7 +8336,12 @@ describe('OAuthProvider', () => {
       params.append('client_secret', exchangeClientSecret);
 
       const response = await exchangeProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
       );
       expect(response.status).toBe(400);
 
@@ -8339,7 +8359,12 @@ describe('OAuthProvider', () => {
       params.append('client_secret', exchangeClientSecret);
 
       const response = await exchangeProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
       );
       expect(response.status).toBe(200);
 
@@ -8372,7 +8397,12 @@ describe('OAuthProvider', () => {
       params.append('client_secret', exchangeClientSecret);
 
       const response = await exchangeProvider.fetch(
-        createMockRequest('https://example.com/oauth/token', 'POST', { 'Content-Type': 'application/x-www-form-urlencoded' }, params.toString())
+        createMockRequest(
+          'https://example.com/oauth/token',
+          'POST',
+          { 'Content-Type': 'application/x-www-form-urlencoded' },
+          params.toString()
+        )
       );
       expect(response.status).toBe(400);
 

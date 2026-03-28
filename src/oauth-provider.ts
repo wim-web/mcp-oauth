@@ -26,11 +26,7 @@ export interface StorageAdapter {
   /**
    * List keys matching a prefix with cursor-based pagination.
    */
-  list(options: {
-    prefix: string;
-    limit?: number;
-    cursor?: string;
-  }): Promise<{
+  list(options: { prefix: string; limit?: number; cursor?: string }): Promise<{
     keys: { name: string }[];
     list_complete: boolean;
     cursor?: string;
@@ -1487,9 +1483,7 @@ class OAuthProviderImpl {
   /**
    * Parses and validates a token endpoint request (used for both token exchange and revocation)
    */
-  private async parseTokenEndpointRequest(
-    request: Request
-  ): Promise<
+  private async parseTokenEndpointRequest(request: Request): Promise<
     | {
         body: any;
         clientInfo: ClientInfo;
@@ -2431,10 +2425,7 @@ class OAuthProviderImpl {
 
     // actor_token_type is required when actor_token is present (RFC 8693 Section 2.1)
     if (actorToken && !actorTokenType) {
-      return this.createErrorResponse(
-        'invalid_request',
-        'actor_token_type is required when actor_token is present'
-      );
+      return this.createErrorResponse('invalid_request', 'actor_token_type is required when actor_token is present');
     }
 
     if (actorTokenType && actorTokenType !== 'urn:ietf:params:oauth:token-type:access_token') {
@@ -3350,13 +3341,7 @@ async function deriveKeyFromToken(tokenStr: string): Promise<CryptoKey> {
 
   const hmacResult = await crypto.subtle.sign('HMAC', hmacKey, encoder.encode(tokenStr));
 
-  return await crypto.subtle.importKey(
-    'raw',
-    hmacResult,
-    { name: 'AES-KW' },
-    false,
-    ['wrapKey', 'unwrapKey']
-  );
+  return await crypto.subtle.importKey('raw', hmacResult, { name: 'AES-KW' }, false, ['wrapKey', 'unwrapKey']);
 }
 
 async function wrapKeyWithToken(tokenStr: string, keyToWrap: CryptoKey): Promise<string> {
@@ -3530,11 +3515,9 @@ class OAuthHelpersImpl implements OAuthHelpers {
         },
       };
 
-      await this.storage.put(
-        `token:${options.userId}:${grantId}:${accessTokenId}`,
-        JSON.stringify(accessTokenData),
-        { expirationTtl: accessTokenTTL }
-      );
+      await this.storage.put(`token:${options.userId}:${grantId}:${accessTokenId}`, JSON.stringify(accessTokenData), {
+        expirationTtl: accessTokenTTL,
+      });
 
       const redirectUrl = new URL(options.request.redirectUri);
       const fragment = new URLSearchParams();
