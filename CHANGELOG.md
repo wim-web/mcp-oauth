@@ -1,5 +1,11 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.1.1
+
+### Patch Changes
+
+- [#9](https://github.com/wim-web/mcp-oauth/pull/9) [`87ef27b`](https://github.com/wim-web/mcp-oauth/commit/87ef27b0053cdc53c0630032510dcf3840983f93) Thanks [@wim-web](https://github.com/wim-web)! - Restore npm provenance for supply chain security.
+
 ## 0.1.0
 
 ### Minor Changes
