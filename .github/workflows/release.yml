@@ -9,7 +9,7 @@ on:
 jobs:
   release:
     permissions:
-      id-token: write # Required for trusted publishing
+      id-token: write # Required for npm provenance
       contents: write
       pull-requests: write
 
@@ -37,4 +37,5 @@ jobs:
           publish: npx changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true

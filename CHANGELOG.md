@@ -1,5 +1,23 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.1.1
+
+### Patch Changes
+
+- [#9](https://github.com/wim-web/mcp-oauth/pull/9) [`87ef27b`](https://github.com/wim-web/mcp-oauth/commit/87ef27b0053cdc53c0630032510dcf3840983f93) Thanks [@wim-web](https://github.com/wim-web)! - Restore npm provenance for supply chain security.
+
+## 0.1.0
+
+### Minor Changes
+
+- [#5](https://github.com/wim-web/mcp-oauth/pull/5) [`5ec83c8`](https://github.com/wim-web/mcp-oauth/commit/5ec83c8364aca6c47af9b1cd94101ca242a89794) Thanks [@wim-web](https://github.com/wim-web)! - Initial release of @0x-wim/mcp-oauth — a platform-independent fork of @cloudflare/workers-oauth-provider with Next.js App Router helpers and OIDC support.
+
+## 0.1.0
+
+### Minor Changes
+
+- [#2](https://github.com/wim-web/mcp-oauth/pull/2) [`9ae9b81`](https://github.com/wim-web/mcp-oauth/commit/9ae9b81f0c919879a128477785db5a1bb9bc48cd) Thanks [@wim-web](https://github.com/wim-web)! - Initial release of mcp-oauth — a platform-independent fork of @cloudflare/workers-oauth-provider with Next.js App Router helpers and OIDC support.
+
 ## 0.3.1
 
 ### Patch Changes

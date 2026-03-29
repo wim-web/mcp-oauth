@@ -1,6 +1,6 @@
 {
-  "name": "mcp-oauth",
-  "version": "0.3.1",
+  "name": "@0x-wim/mcp-oauth",
+  "version": "0.1.1",
   "description": "Platform-independent OAuth 2.1 authorization provider",
   "type": "module",
   "sideEffects": false,
@@ -52,6 +52,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/wim-web/mcp-oauth-provider"
+    "url": "https://github.com/wim-web/mcp-oauth"
   }
 }
