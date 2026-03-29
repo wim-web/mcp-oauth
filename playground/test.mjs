@@ -21,9 +21,11 @@ console.log('✓ next: createOAuthHandlers returned', Object.keys(handlers).join
 
 // Test: oidc import
 const jwt = parseJwt(
-  btoa(JSON.stringify({ alg: 'RS256' })).replace(/=/g, '') + '.' +
-  btoa(JSON.stringify({ sub: 'test' })).replace(/=/g, '') + '.' +
-  btoa('sig').replace(/=/g, '')
+  btoa(JSON.stringify({ alg: 'RS256' })).replace(/=/g, '') +
+    '.' +
+    btoa(JSON.stringify({ sub: 'test' })).replace(/=/g, '') +
+    '.' +
+    btoa('sig').replace(/=/g, '')
 );
 console.log('✓ oidc: parseJwt sub =', jwt.payload.sub);
 

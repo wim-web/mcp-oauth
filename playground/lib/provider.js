@@ -57,19 +57,29 @@ providerRef = new OAuthProvider({
           const mcpServer = createMcpServer();
           await mcpServer.connect(transport);
         } else if (request.method === 'GET') {
-          return new Response(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'No active session. Send POST with initialize first.' }, id: null }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: 'No active session. Send POST with initialize first.' },
+              id: null,
+            }),
+            {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
         } else if (request.method === 'DELETE') {
           if (sessionId && mcpTransports.has(sessionId)) {
             mcpTransports.delete(sessionId);
             return new Response(null, { status: 204 });
           }
-          return new Response(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Session not found' }, id: null }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
+          return new Response(
+            JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Session not found' }, id: null }),
+            {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
         } else {
           return new Response('Method not allowed', { status: 405 });
         }
@@ -79,7 +89,11 @@ providerRef = new OAuthProvider({
         });
 
         // For GET SSE: inject a comment to flush headers so clients don't hang
-        if (request.method === 'GET' && response.headers.get('content-type')?.includes('text/event-stream') && response.body) {
+        if (
+          request.method === 'GET' &&
+          response.headers.get('content-type')?.includes('text/event-stream') &&
+          response.body
+        ) {
           const original = response.body;
           const injected = new ReadableStream({
             async start(controller) {
@@ -100,10 +114,12 @@ providerRef = new OAuthProvider({
               original.cancel();
             },
           });
-          return addCorsToResponse(new Response(injected, {
-            status: response.status,
-            headers: response.headers,
-          }));
+          return addCorsToResponse(
+            new Response(injected, {
+              status: response.status,
+              headers: response.headers,
+            })
+          );
         }
 
         return addCorsToResponse(response);

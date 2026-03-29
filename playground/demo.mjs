@@ -57,15 +57,17 @@ const meta = await metaRes.json();
 console.log('1. Server Metadata:', JSON.stringify(meta, null, 2), '\n');
 
 // 2. クライアント登録
-const regRes = await providerRef.fetch(new Request('https://example.com/oauth/register', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    redirect_uris: ['https://client.example.com/callback'],
-    client_name: 'Demo Client',
-    token_endpoint_auth_method: 'client_secret_basic',
-  }),
-}));
+const regRes = await providerRef.fetch(
+  new Request('https://example.com/oauth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      redirect_uris: ['https://client.example.com/callback'],
+      client_name: 'Demo Client',
+      token_endpoint_auth_method: 'client_secret_basic',
+    }),
+  })
+);
 const client = await regRes.json();
 console.log('2. Client Registered:', { client_id: client.client_id, client_name: client.client_name }, '\n');
 
@@ -87,33 +89,48 @@ const tokenParams = new URLSearchParams({
   client_secret: client.client_secret,
   code_verifier: pkce.verifier,
 });
-const tokenRes = await providerRef.fetch(new Request('https://example.com/oauth/token', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  body: tokenParams.toString(),
-}));
+const tokenRes = await providerRef.fetch(
+  new Request('https://example.com/oauth/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: tokenParams.toString(),
+  })
+);
 const tokens = await tokenRes.json();
-console.log('4. Tokens:', {
-  access_token: tokens.access_token.slice(0, 20) + '...',
-  token_type: tokens.token_type,
-  expires_in: tokens.expires_in,
-  has_refresh_token: !!tokens.refresh_token,
-}, '\n');
+console.log(
+  '4. Tokens:',
+  {
+    access_token: tokens.access_token.slice(0, 20) + '...',
+    token_type: tokens.token_type,
+    expires_in: tokens.expires_in,
+    has_refresh_token: !!tokens.refresh_token,
+  },
+  '\n'
+);
 
 // 5. API アクセス (Bearer トークン)
-const apiRes = await providerRef.fetch(new Request('https://example.com/api/data', {
-  headers: { Authorization: `Bearer ${tokens.access_token}` },
-}));
+const apiRes = await providerRef.fetch(
+  new Request('https://example.com/api/data', {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  })
+);
 const apiData = await apiRes.json();
 console.log('5. API Response:', apiData, '\n');
 
 // 6. getAuth (mcp-oauth/next)
-const authResult = await getAuth(providerRef, new Request('https://example.com/api/data', {
-  headers: { Authorization: `Bearer ${tokens.access_token}` },
-}));
-console.log('6. getAuth:', {
-  authenticated: authResult.authenticated,
-  props: authResult.authenticated ? authResult.token.grant.props : null,
-}, '\n');
+const authResult = await getAuth(
+  providerRef,
+  new Request('https://example.com/api/data', {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  })
+);
+console.log(
+  '6. getAuth:',
+  {
+    authenticated: authResult.authenticated,
+    props: authResult.authenticated ? authResult.token.grant.props : null,
+  },
+  '\n'
+);
 
 console.log('=== All OK! ===');

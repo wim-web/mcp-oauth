@@ -276,7 +276,18 @@ export default function Home() {
           </button>
         )}
         {(state === 'ready' || state === 'done') && (
-          <button onClick={() => { sessionStorage.clear(); setClientId(null); setTokens(null); setUserInfo(null); setError(null); setLogs([]); setState('idle'); }} style={{ ...btnStyle, background: '#666' }}>
+          <button
+            onClick={() => {
+              sessionStorage.clear();
+              setClientId(null);
+              setTokens(null);
+              setUserInfo(null);
+              setError(null);
+              setLogs([]);
+              setState('idle');
+            }}
+            style={{ ...btnStyle, background: '#666' }}
+          >
             Reset
           </button>
         )}
@@ -312,7 +323,7 @@ export default function Home() {
                 scope: tokens.scope,
               },
               null,
-              2,
+              2
             )}
           </pre>
         </div>
@@ -349,14 +360,30 @@ export default function Home() {
                 <input
                   value={toolArgs}
                   onChange={(e) => setToolArgs(e.target.value)}
-                  style={{ flex: 1, padding: '8px 12px', borderRadius: 6, border: '1px solid #ddd', fontSize: 14, fontFamily: 'monospace' }}
+                  style={{
+                    flex: 1,
+                    padding: '8px 12px',
+                    borderRadius: 6,
+                    border: '1px solid #ddd',
+                    fontSize: 14,
+                    fontFamily: 'monospace',
+                  }}
                 />
                 <button onClick={mcpCall} style={{ ...btnStyle, background: '#7c3aed', padding: '8px 16px' }}>
                   Call
                 </button>
               </div>
               {mcpResult && (
-                <pre style={{ fontSize: 12, background: '#fff', padding: 12, borderRadius: 6, overflow: 'auto', margin: 0 }}>
+                <pre
+                  style={{
+                    fontSize: 12,
+                    background: '#fff',
+                    padding: 12,
+                    borderRadius: 6,
+                    overflow: 'auto',
+                    margin: 0,
+                  }}
+                >
                   {JSON.stringify(mcpResult, null, 2)}
                 </pre>
               )}

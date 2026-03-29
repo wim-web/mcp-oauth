@@ -44,15 +44,15 @@ npm run dev -- --port 3456
 
 ## エンドポイント一覧
 
-| パス | 説明 |
-|---|---|
-| `/` | Playground Web UI |
-| `/.well-known/oauth-authorization-server` | OAuth メタデータ (RFC 8414) |
-| `/oauth/register` | クライアント動的登録 (RFC 7591) |
-| `/oauth/authorize` | 認可エンドポイント |
-| `/oauth/token` | トークンエンドポイント |
-| `/mcp` | MCP エンドポイント (OAuth 認証必須) |
-| `/api/me` | ユーザー情報 API (Bearer トークン) |
+| パス                                      | 説明                                |
+| ----------------------------------------- | ----------------------------------- |
+| `/`                                       | Playground Web UI                   |
+| `/.well-known/oauth-authorization-server` | OAuth メタデータ (RFC 8414)         |
+| `/oauth/register`                         | クライアント動的登録 (RFC 7591)     |
+| `/oauth/authorize`                        | 認可エンドポイント                  |
+| `/oauth/token`                            | トークンエンドポイント              |
+| `/mcp`                                    | MCP エンドポイント (OAuth 認証必須) |
+| `/api/me`                                 | ユーザー情報 API (Bearer トークン)  |
 
 ## MCP Inspector
 
