@@ -10,11 +10,11 @@ npm install @0x-wim/mcp-oauth
 
 ## Packages
 
-| Entry point | Contents |
-|---|---|
-| `@0x-wim/mcp-oauth` | Core `OAuthProvider`, `MemoryStore`, `StorageAdapter` |
+| Entry point              | Contents                                                      |
+| ------------------------ | ------------------------------------------------------------- |
+| `@0x-wim/mcp-oauth`      | Core `OAuthProvider`, `MemoryStore`, `StorageAdapter`         |
 | `@0x-wim/mcp-oauth/next` | Next.js App Router helpers (`createOAuthHandlers`, `getAuth`) |
-| `@0x-wim/mcp-oauth/oidc` | OIDC discovery and ID token verification |
+| `@0x-wim/mcp-oauth/oidc` | OIDC discovery and ID token verification                      |
 
 ## Storage
 
