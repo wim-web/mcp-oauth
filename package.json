@@ -50,6 +50,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/wim-web/mcp-oauth-provider"
+    "url": "https://github.com/wim-web/mcp-oauth"
   }
 }
