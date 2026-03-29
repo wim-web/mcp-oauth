@@ -27,6 +27,7 @@
     "access": "public"
   },
   "scripts": {
+    "dev": "concurrently -n build,playground -c blue,green \"npm run build:watch\" \"npm --prefix playground run dev -- --port 3456\"",
     "build": "tsdown",
     "build:watch": "tsdown --watch",
     "check": "npm run typecheck && npm run test",
@@ -42,6 +43,7 @@
     "@changesets/changelog-github": "^0.5.2",
     "@changesets/cli": "^2.29.8",
     "@types/node": "^25.5.0",
+    "concurrently": "^9.2.1",
     "pkg-pr-new": "^0.0.62",
     "prettier": "^3.7.4",
     "tsdown": "^0.18.1",
