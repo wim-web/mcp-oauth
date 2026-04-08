@@ -76,12 +76,77 @@ describe('createOAuthHandlers', () => {
     const response = await handlers.OPTIONS(request);
     expect(response.headers.get('Access-Control-Allow-Origin')).toBeDefined();
   });
+
+  it('should normalize standalone internal request URLs to the public host', async () => {
+    const handlers = createOAuthHandlers(provider);
+    const request = createMockRequest('http://ip-10-100-32-91.internal:3000/api/data', 'GET', {
+      host: 'mcp.example.com',
+      'x-forwarded-proto': 'https',
+    });
+
+    const response = await handlers.GET(request);
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('WWW-Authenticate')).toContain(
+      'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/api/data"'
+    );
+  });
 });
 
 describe('getAuth', () => {
   let provider: OAuthProvider;
   let memoryStore: MemoryStore;
   let accessToken: string;
+
+  async function issueAccessToken(resource?: string): Promise<string> {
+    const registerResponse = await provider.fetch(
+      new Request('https://example.com/oauth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uris: ['https://client.example.com/callback'],
+          client_name: 'Test Client',
+          token_endpoint_auth_method: 'client_secret_basic',
+        }),
+      })
+    );
+    const client = (await registerResponse.json()) as any;
+
+    const authorizeParams = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: 'https://client.example.com/callback',
+      scope: 'read write',
+      state: 'xyz',
+    });
+    if (resource) {
+      authorizeParams.append('resource', resource);
+    }
+
+    const authResponse = await provider.fetch(createMockRequest(`https://example.com/authorize?${authorizeParams}`));
+    const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
+
+    const tokenParams = new URLSearchParams();
+    tokenParams.append('grant_type', 'authorization_code');
+    tokenParams.append('code', code);
+    tokenParams.append('redirect_uri', 'https://client.example.com/callback');
+    tokenParams.append('client_id', client.client_id);
+    tokenParams.append('client_secret', client.client_secret);
+    if (resource) {
+      tokenParams.append('resource', resource);
+    }
+
+    const tokenResponse = await provider.fetch(
+      new Request('https://example.com/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: tokenParams.toString(),
+      })
+    );
+    const tokens = (await tokenResponse.json()) as any;
+
+    return tokens.access_token;
+  }
 
   beforeEach(async () => {
     memoryStore = new MemoryStore();
@@ -117,47 +182,7 @@ describe('getAuth', () => {
       storage: memoryStore,
     });
     provider = providerRef;
-
-    // Register a client
-    const registerResponse = await provider.fetch(
-      new Request('https://example.com/oauth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          redirect_uris: ['https://client.example.com/callback'],
-          client_name: 'Test Client',
-          token_endpoint_auth_method: 'client_secret_basic',
-        }),
-      })
-    );
-    const client = (await registerResponse.json()) as any;
-
-    // Authorize
-    const authResponse = await provider.fetch(
-      createMockRequest(
-        `https://example.com/authorize?response_type=code&client_id=${client.client_id}` +
-          `&redirect_uri=${encodeURIComponent('https://client.example.com/callback')}&scope=read%20write&state=xyz`
-      )
-    );
-    const code = new URL(authResponse.headers.get('Location')!).searchParams.get('code')!;
-
-    // Exchange for tokens
-    const params = new URLSearchParams();
-    params.append('grant_type', 'authorization_code');
-    params.append('code', code);
-    params.append('redirect_uri', 'https://client.example.com/callback');
-    params.append('client_id', client.client_id);
-    params.append('client_secret', client.client_secret);
-
-    const tokenResponse = await provider.fetch(
-      new Request('https://example.com/oauth/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: params.toString(),
-      })
-    );
-    const tokens = (await tokenResponse.json()) as any;
-    accessToken = tokens.access_token;
+    accessToken = await issueAccessToken();
   });
 
   it('should return authenticated result with valid token', async () => {
@@ -172,6 +197,19 @@ describe('getAuth', () => {
       expect(result.token.grant.props.userId).toBe('test-user-123');
       expect(result.token.grant.props.role).toBe('admin');
     }
+  });
+
+  it('should validate token audience against the normalized public request URL', async () => {
+    const publicAudienceToken = await issueAccessToken('https://public.example.com/api');
+    const request = createMockRequest('http://ip-10-100-32-91.internal:3000/api/data', 'GET', {
+      Authorization: `Bearer ${publicAudienceToken}`,
+      host: 'public.example.com',
+      'x-forwarded-proto': 'https',
+    });
+
+    const result = await getAuth(provider, request);
+
+    expect(result.authenticated).toBe(true);
   });
 
   it('should return failure when Authorization header is missing', async () => {
@@ -254,6 +292,31 @@ describe('getAuth', () => {
       const body = (await result.error.json()) as any;
       expect(body.error_description).toContain('audience');
     }
+  });
+
+  it('should pass the normalized public request URL to external token resolvers', async () => {
+    const request = createMockRequest('http://ip-10-100-32-91.internal:3000/api/data', 'GET', {
+      Authorization: 'Bearer external-opaque-token',
+      host: 'public.example.com',
+      'x-forwarded-proto': 'https',
+    });
+
+    let seenUrl = '';
+    const result = await getAuth(provider, request, {
+      resolveExternalToken: async ({ token, request }) => {
+        seenUrl = request.url;
+        if (token === 'external-opaque-token') {
+          return {
+            props: { sub: 'ext-user' },
+            audience: 'https://public.example.com/api',
+          };
+        }
+        return null;
+      },
+    });
+
+    expect(seenUrl).toBe('https://public.example.com/api/data');
+    expect(result.authenticated).toBe(true);
   });
 
   it('should auto-resolve external token from provider configuration', async () => {
