@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.2.1
+
+### Patch Changes
+
+- [#18](https://github.com/wim-web/mcp-oauth/pull/18) [`4e00e42`](https://github.com/wim-web/mcp-oauth/commit/4e00e42134c1b23f09f5f437aa5ca283fb2965bf) Thanks [@wim-web](https://github.com/wim-web)! - Normalize Next.js App Router request URLs from forwarded headers before
+  calling the OAuth provider, so standalone and Docker deployments use the
+  public host for OAuth metadata and audience checks.
+
 ## 0.2.0
 
 ### Minor Changes
