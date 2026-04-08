@@ -1,5 +1,13 @@
 # @cloudflare/workers-oauth-provider
 
+## 0.2.0
+
+### Minor Changes
+
+- [#15](https://github.com/wim-web/mcp-oauth/pull/15) [`101f60b`](https://github.com/wim-web/mcp-oauth/commit/101f60b05c72a371859fa6e3b0b78276a2303080) Thanks [@wim-web](https://github.com/wim-web)! - Merge upstream RFC 9728 path-aware protected resource metadata support, including path-suffixed
+  `resource_metadata` URLs in `WWW-Authenticate` headers and a new `resourceMatchOriginOnly`
+  migration option for origin-only grants.
+
 ## 0.1.1
 
 ### Patch Changes
