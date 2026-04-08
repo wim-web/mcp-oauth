@@ -75,6 +75,11 @@ import { createOAuthHandlers } from '@0x-wim/mcp-oauth/next';
 export const { GET, POST, OPTIONS, DELETE, PUT, PATCH } = createOAuthHandlers(provider);
 ```
 
+The Next adapter automatically reconstructs the public request URL from
+`Forwarded`, `X-Forwarded-*`, and `Host` headers before calling the provider, so
+standalone/Docker deployments do not leak internal hostnames in OAuth metadata
+or audience checks.
+
 Authenticate requests in route handlers:
 
 ```ts
