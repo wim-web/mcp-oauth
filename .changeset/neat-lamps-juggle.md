@@ -1,3 +1,4 @@
+---
 '@0x-wim/mcp-oauth': minor
 ---
 
