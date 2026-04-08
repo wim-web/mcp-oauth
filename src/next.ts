@@ -19,6 +19,8 @@ export interface OAuthRouteHandlers {
 
 /**
  * Create Next.js App Router route handlers that delegate to an OAuthProvider.
+ * Reconstructs the public request URL from forwarded headers when Next standalone
+ * provides an internal container hostname in `request.url`.
  *
  * Usage in `app/[...oauth]/route.ts`:
  * ```typescript
@@ -26,7 +28,7 @@ export interface OAuthRouteHandlers {
  * ```
  */
 export function createOAuthHandlers(provider: OAuthProvider): OAuthRouteHandlers {
-  const handler: RouteHandler = (request) => provider.fetch(request);
+  const handler: RouteHandler = (request) => provider.fetch(normalizeNextRequest(request));
   return {
     GET: handler,
     POST: handler,
@@ -83,6 +85,10 @@ export interface GetAuthOptions {
  * the external resolver. In practice this is safe because external resolvers
  * validate their own token format and will not re-authenticate an internal token.
  *
+ * For Next standalone deployments, `getAuth()` also normalizes internal
+ * container hostnames in `request.url` using forwarded headers before doing
+ * audience validation or invoking an external token resolver.
+ *
  * Usage:
  * ```typescript
  * const provider = new OAuthProvider({ ...options, resolveExternalToken });
@@ -106,7 +112,8 @@ export async function getAuth<T = any>(
   request: Request,
   options?: GetAuthOptions
 ): Promise<AuthResult<T> | AuthFailure> {
-  const authHeader = request.headers.get('Authorization');
+  const normalizedRequest = normalizeNextRequest(request);
+  const authHeader = normalizedRequest.headers.get('Authorization');
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return {
@@ -127,7 +134,7 @@ export async function getAuth<T = any>(
   const tokenSummary = await provider.unwrapToken<T>(rawToken);
 
   if (tokenSummary) {
-    if (!validateAudience(tokenSummary.audience, request)) {
+    if (!validateAudience(tokenSummary.audience, normalizedRequest)) {
       return audienceMismatchResponse();
     }
     return { authenticated: true, token: tokenSummary };
@@ -137,9 +144,9 @@ export async function getAuth<T = any>(
   // Explicit options take precedence; otherwise use the resolver configured on the provider.
   const resolver = options?.resolveExternalToken ?? provider.getResolveExternalToken();
   if (resolver) {
-    const ext = await resolver({ token: rawToken, request });
+    const ext = await resolver({ token: rawToken, request: normalizedRequest });
     if (ext) {
-      if (!validateAudience(ext.audience, request)) {
+      if (!validateAudience(ext.audience, normalizedRequest)) {
         return audienceMismatchResponse();
       }
       return {
@@ -174,6 +181,105 @@ export async function getAuth<T = any>(
       },
     }),
   };
+}
+
+function normalizeNextRequest(request: Request): Request {
+  const publicUrl = derivePublicRequestUrl(request);
+  if (!publicUrl || publicUrl === request.url) {
+    return request;
+  }
+
+  return new Request(publicUrl, request);
+}
+
+function derivePublicRequestUrl(request: Request): string | null {
+  const requestUrl = new URL(request.url);
+  const forwarded = parseForwardedHeader(request.headers.get('forwarded'));
+  const host = firstHeaderValue(
+    forwarded.host ?? request.headers.get('x-forwarded-host') ?? request.headers.get('host')
+  );
+
+  if (!host) {
+    return null;
+  }
+
+  const protocol = resolveProtocol(
+    forwarded.proto ?? firstHeaderValue(request.headers.get('x-forwarded-proto')),
+    requestUrl
+  );
+  const authority = applyForwardedPort(host, protocol, firstHeaderValue(request.headers.get('x-forwarded-port')));
+
+  return `${protocol}://${authority}${requestUrl.pathname}${requestUrl.search}${requestUrl.hash}`;
+}
+
+function parseForwardedHeader(value: string | null): { host?: string; proto?: string } {
+  if (!value) {
+    return {};
+  }
+
+  const firstEntry = value.split(',')[0];
+  const result: { host?: string; proto?: string } = {};
+
+  for (const part of firstEntry.split(';')) {
+    const [rawKey, rawValue] = part.split('=', 2);
+    if (!rawKey || !rawValue) {
+      continue;
+    }
+
+    const key = rawKey.trim().toLowerCase();
+    const parsedValue = unquoteHeaderValue(rawValue.trim());
+
+    if (key === 'host') {
+      result.host = parsedValue;
+    } else if (key === 'proto') {
+      result.proto = parsedValue;
+    }
+  }
+
+  return result;
+}
+
+function firstHeaderValue(value: string | null | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const firstValue = value.split(',')[0]?.trim();
+  return firstValue ? unquoteHeaderValue(firstValue) : undefined;
+}
+
+function unquoteHeaderValue(value: string): string {
+  return value.replace(/^"(.*)"$/, '$1');
+}
+
+function resolveProtocol(forwardedProto: string | undefined, requestUrl: URL): 'http' | 'https' {
+  const fallback = requestUrl.protocol === 'https:' ? 'https' : 'http';
+  if (!forwardedProto) {
+    return fallback;
+  }
+
+  const normalized = forwardedProto.toLowerCase();
+  return normalized === 'https' || normalized === 'http' ? normalized : fallback;
+}
+
+function applyForwardedPort(host: string, protocol: 'http' | 'https', forwardedPort: string | undefined): string {
+  if (!forwardedPort || hostHasExplicitPort(host) || isDefaultPort(protocol, forwardedPort)) {
+    return host;
+  }
+
+  return `${host}:${forwardedPort}`;
+}
+
+function hostHasExplicitPort(host: string): boolean {
+  if (host.startsWith('[')) {
+    return host.includes(']:');
+  }
+
+  return host.includes(':');
+}
+
+function isDefaultPort(protocol: 'http' | 'https', port: string): boolean {
+  return (protocol === 'https' && port === '443') || (protocol === 'http' && port === '80');
 }
 
 /**
